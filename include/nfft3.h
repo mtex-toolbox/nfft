@@ -158,6 +158,9 @@ typedef struct\
   R *spline_coeffs; /**< Input for de Boor algorithm if B_SPLINE or SINC_POWER is defined */\
 \
   NFFT_INT *index_x; /**< Index array for nodes x used when flag \ref NFFT_SORT_NODES is set. */\
+\
+  Y(plan) *my_fftw_plans_pruned; /**< Two forward and two backward FFTW plans \
+    of the pruned 3d FFT, used when flag \ref NFFT_PRUNED_FFT is set */\
 } X(plan); \
 \
 NFFT_EXTERN void X(trafo_direct)(const X(plan) *ths);\
@@ -205,6 +208,7 @@ NFFT_DEFINE_API(NFFT_MANGLE_LONG_DOUBLE,FFTW_MANGLE_LONG_DOUBLE,long double,fftw
 #define FFTW_INIT                  (1U<<10)
 #define NFFT_SORT_NODES            (1U<<11)
 #define NFFT_OMP_BLOCKWISE_ADJOINT (1U<<12)
+#define NFFT_PRUNED_FFT            (1U<<13)
 #define PRE_ONE_PSI (PRE_LIN_PSI| PRE_FG_PSI| PRE_PSI| PRE_FULL_PSI)
 
 /* nfct */
