@@ -209,6 +209,11 @@ NFFT_DEFINE_API(NFFT_MANGLE_LONG_DOUBLE,FFTW_MANGLE_LONG_DOUBLE,long double,fftw
 #define NFFT_SORT_NODES            (1U<<11)
 #define NFFT_OMP_BLOCKWISE_ADJOINT (1U<<12)
 #define NFFT_PRUNED_FFT            (1U<<13)
+/* Real valued functions: f_hat holds the half spectrum k_{d-1} = 0 .. N_{d-1}/2 - 1
+ * of the last dimension, N_total of them, the trafo sets the real part of f to
+ * 2 Re sum_k f_hat_k exp(-2 pi i k x_j) and the adjoint reads the real part of
+ * f into f_hat_k = sum_j f_j exp(2 pi i k x_j). Fast for d = 2, 3. */
+#define NFFT_REAL                  (1U<<14)
 #define PRE_ONE_PSI (PRE_LIN_PSI| PRE_FG_PSI| PRE_PSI| PRE_FULL_PSI)
 
 /* nfct */

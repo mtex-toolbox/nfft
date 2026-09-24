@@ -183,8 +183,72 @@ static inline R X(reduced_omega_multi)(const INT d, const INT *k, const R *x)
   return K2PI * (s - RINT(s));              /* reduce the sum mod 1, then scale by 2pi */
 }
 
+/* frequency vector of the k-th coefficient of a real plan, whose last
+ * dimension holds the orders 0 .. N_{d-1}/2 - 1 only */
+static void real_frequency(const X(plan) *ths, INT k, R *kv)
+{
+  for (INT t = ths->d - 1; t >= 0; t--)
+  {
+    const INT len = t == ths->d - 1 ? ths->N[t] / 2 : ths->N[t];
+    kv[t] = (R)(k % len - (t == ths->d - 1 ? 0 : ths->N[t] / 2));
+    k /= len;
+  }
+}
+
+/* NFFT_REAL by summation, for any d and the lattices too small for the window */
+static void real_direct(const X(plan) *ths, const int adjoint)
+{
+  const INT d = ths->d;
+  INT k, j;
+
+  if (adjoint)
+  {
+#ifdef _OPENMP
+    #pragma omp parallel for default(shared) private(j)
+#endif
+    for (k = 0; k < ths->N_total; k++)
+    {
+      R kv[d];
+      C s = K(0.0);
+      real_frequency(ths, k, kv);
+      for (j = 0; j < ths->M_total; j++)
+      {
+        R a = K(0.0);
+        for (INT t = 0; t < d; t++)
+          a += kv[t] * ths->x[j * d + t];
+        s += CREAL(ths->f[j]) * CEXP(K2PI * I * a);
+      }
+      ths->f_hat[k] = s;
+    }
+    return;
+  }
+
+#ifdef _OPENMP
+  #pragma omp parallel for default(shared) private(k)
+#endif
+  for (j = 0; j < ths->M_total; j++)
+  {
+    C s = K(0.0);
+    for (k = 0; k < ths->N_total; k++)
+    {
+      R kv[d], a = K(0.0);
+      real_frequency(ths, k, kv);
+      for (INT t = 0; t < d; t++)
+        a += kv[t] * ths->x[j * d + t];
+      s += ths->f_hat[k] * CEXP(-K2PI * I * a);
+    }
+    ths->f[j] = K(2.0) * CREAL(s);
+  }
+}
+
 void X(trafo_direct)(const X(plan) *ths)
 {
+  if (ths->flags & NFFT_REAL)
+  {
+    real_direct(ths, 0);
+    return;
+  }
+
   C *f_hat = (C*)ths->f_hat, *f = (C*)ths->f;
 
   if (ths->d == 1)
@@ -342,6 +406,12 @@ static void X(adjoint_direct_rows)(const X(plan) *ths, const INT rlo, const INT 
 
 void X(adjoint_direct)(const X(plan) *ths)
 {
+  if (ths->flags & NFFT_REAL)
+  {
+    real_direct(ths, 1);
+    return;
+  }
+
   C *f_hat = (C*)ths->f_hat, *f = (C*)ths->f;
 
   memset(f_hat, 0, (size_t)(ths->N_total) * sizeof(C));
@@ -5338,6 +5408,378 @@ void X(adjoint_3d)(X(plan) *ths)
 
 /** user routines
  */
+/* ######################################## REAL VALUED FUNCTIONS (NFFT_REAL) */
+
+/* 1/phi_hat of the frequency k along dimension t */
+static inline R real_phi_inv(const X(plan) *ths, const INT t, const INT k)
+{
+  return (ths->flags & PRE_PHI_HUT) ? ths->c_phi_inv[t][k + ths->N[t] / 2]
+    : K(1.0) / PHI_HUT(ths->n[t], k, t);
+}
+
+/* Offset of the row of f_hat's leading multi-index r in the half lattice g1,
+ * its factor 1/phi_hat, in *mlat the offset of the negated multi-index and in
+ * *refl its row of f_hat, or -1 where that lies outside f_hat. */
+static INT real_row(const X(plan) *ths, INT r, R *c, INT *mlat, INT *refl)
+{
+  INT lat = 0, ml = 0, lstride = 1, rr = 0, rstride = 1;
+
+  *c = K(1.0);
+  for (INT t = ths->d - 2; t >= 0; t--)
+  {
+    const INT k = r % ths->N[t] - ths->N[t] / 2;
+    r /= ths->N[t];
+    lat += ((k + ths->n[t]) % ths->n[t]) * lstride;
+    ml += ((ths->n[t] - k) % ths->n[t]) * lstride;
+    lstride *= ths->n[t];
+    if (k == -ths->N[t] / 2)
+      rr = -1;
+    else if (rr >= 0)
+      rr += (ths->N[t] / 2 - k) * rstride;
+    rstride *= ths->N[t];
+    *c *= real_phi_inv(ths, t, k);
+  }
+  *refl = rr;
+  *mlat = ml * (ths->n[ths->d - 1] / 2 + 1);
+  return lat * (ths->n[ths->d - 1] / 2 + 1);
+}
+
+/* g1 = conj of the Hermitian extension of f_hat / phi_hat on the half lattice,
+ * conjugated since FFTW's c2r sums with exp(+2 pi i k l / n). The plane k = 0
+ * takes f_hat_k + conj(f_hat_-k), so that the full sum is 2 Re of the half;
+ * where -k is outside f_hat, conj(f_hat_k) goes to -k itself. */
+static void real_D_trafo(X(plan) *ths)
+{
+  const INT Nl = ths->N[ths->d - 1] / 2, rows = ths->N_total / Nl;
+  const INT half = ths->n_total / ths->n[ths->d - 1] * (ths->n[ths->d - 1] / 2 + 1);
+  INT r;
+
+  memset(ths->g1, 0, (size_t)half * sizeof(C));
+
+#ifdef _OPENMP
+  #pragma omp parallel for default(shared) private(r)
+#endif
+  for (r = 0; r < rows; r++)
+  {
+    R c;
+    INT mlat, refl;
+    C *g = ths->g1 + real_row(ths, r, &c, &mlat, &refl);
+    const C *fh = ths->f_hat + r * Nl;
+    const R c0 = c * real_phi_inv(ths, ths->d - 1, 0);
+
+    for (INT l = 0; l < Nl; l++)
+      g[l] = CONJ(fh[l]) * (c * real_phi_inv(ths, ths->d - 1, l));
+    if (refl >= 0)
+      g[0] += ths->f_hat[refl * Nl] * c0;
+    else
+      ths->g1[mlat] = fh[0] * c0;
+  }
+}
+
+/* f_hat from the half lattice after FFTW's r2c, which sums with exp(-2 pi i k l / n) */
+static void real_D_adjoint(X(plan) *ths)
+{
+  const INT Nl = ths->N[ths->d - 1] / 2, rows = ths->N_total / Nl;
+  INT r;
+
+#ifdef _OPENMP
+  #pragma omp parallel for default(shared) private(r)
+#endif
+  for (r = 0; r < rows; r++)
+  {
+    R c;
+    INT mlat, refl;
+    const C *g = ths->g1 + real_row(ths, r, &c, &mlat, &refl);
+    C *fh = ths->f_hat + r * Nl;
+
+    for (INT l = 0; l < Nl; l++)
+      fh[l] = CONJ(g[l]) * (c * real_phi_inv(ths, ths->d - 1, l));
+  }
+}
+
+static inline void trafo_real_2d_w(R *fj, const R *g, const R *psij_const0,
+    const R *psij_const1, const R *xj0, const R *xj1, const INT n0,
+    const INT n1, const INT m, const INT w)
+{
+  INT u0, o0, u1, o1, l, l0;
+  INT i0[w], i1[w];
+  R t[w], sum = K(0.0);
+
+  uo2(&u0, &o0, *xj0, n0, m);
+  uo2(&u1, &o1, *xj1, n1, m);
+  window_indices(i0, u0, n0, w);
+  window_indices(i1, u1, n1, w);
+
+  for (l = 0; l < w; l++)
+    t[l] = K(0.0);
+
+  for (l0 = 0; l0 < w; l0++)
+  {
+    const R *restrict gj = g + i0[l0] * n1;
+    const R p = psij_const0[l0];
+    if (u1 < o1)
+      for (l = 0; l < w; l++)
+        t[l] += p * gj[u1 + l];
+    else
+      for (l = 0; l < w; l++)
+        t[l] += p * gj[i1[l]];
+  }
+
+  for (l = 0; l < w; l++)
+    sum += psij_const1[l] * t[l];
+
+  *fj = sum;
+}
+
+static inline void trafo_real_3d_w(R *fj, const R *g, const R *psij_const0,
+    const R *psij_const1, const R *psij_const2, const R *xj0, const R *xj1,
+    const R *xj2, const INT n0, const INT n1, const INT n2, const INT m,
+    const INT w)
+{
+  INT u0, o0, u1, o1, u2, o2, l, l0, l1;
+  INT i0[w], i1[w], i2[w];
+  R t[w], sum = K(0.0);
+
+  uo2(&u0, &o0, *xj0, n0, m);
+  uo2(&u1, &o1, *xj1, n1, m);
+  uo2(&u2, &o2, *xj2, n2, m);
+  window_indices(i0, u0, n0, w);
+  window_indices(i1, u1, n1, w);
+  window_indices(i2, u2, n2, w);
+
+  for (l = 0; l < w; l++)
+    t[l] = K(0.0);
+
+  for (l0 = 0; l0 < w; l0++)
+    for (l1 = 0; l1 < w; l1++)
+    {
+      const R *restrict gj = g + (i0[l0] * n1 + i1[l1]) * n2;
+      const R p = psij_const0[l0] * psij_const1[l1];
+      if (u2 < o2)
+        for (l = 0; l < w; l++)
+          t[l] += p * gj[u2 + l];
+      else
+        for (l = 0; l < w; l++)
+          t[l] += p * gj[i2[l]];
+    }
+
+  for (l = 0; l < w; l++)
+    sum += psij_const2[l] * t[l];
+
+  *fj = sum;
+}
+
+/* adds f psi into the rows k0 in [my_u0, my_o0] of g */
+static inline void adjoint_real_2d_w(const R f, R *g, const R *psij_const0,
+    const R *psij_const1, const R *xj0, const R *xj1, const INT n0,
+    const INT n1, const INT my_u0, const INT my_o0, const INT m, const INT w)
+{
+  INT u0, o0, u1, o1, l, l0;
+  INT i1[w];
+  R v[w];
+
+  uo2(&u0, &o0, *xj0, n0, m);
+  uo2(&u1, &o1, *xj1, n1, m);
+  window_indices(i1, u1, n1, w);
+
+  for (l = 0; l < w; l++)
+    v[l] = f * psij_const1[l];
+
+  for (l0 = 0; l0 < w; l0++)
+  {
+    const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
+    if (k0 < my_u0 || k0 > my_o0)
+      continue;
+    R *restrict gj = g + k0 * n1;
+    const R p = psij_const0[l0];
+    if (u1 < o1)
+      for (l = 0; l < w; l++)
+        gj[u1 + l] += p * v[l];
+    else
+      for (l = 0; l < w; l++)
+        gj[i1[l]] += p * v[l];
+  }
+}
+
+static inline void adjoint_real_3d_w(const R f, R *g, const R *psij_const0,
+    const R *psij_const1, const R *psij_const2, const R *xj0, const R *xj1,
+    const R *xj2, const INT n0, const INT n1, const INT n2, const INT my_u0,
+    const INT my_o0, const INT m, const INT w)
+{
+  INT u0, o0, u1, o1, u2, o2, l, l0, l1;
+  INT i1[w], i2[w];
+  R v[w];
+
+  uo2(&u0, &o0, *xj0, n0, m);
+  uo2(&u1, &o1, *xj1, n1, m);
+  uo2(&u2, &o2, *xj2, n2, m);
+  window_indices(i1, u1, n1, w);
+  window_indices(i2, u2, n2, w);
+
+  for (l = 0; l < w; l++)
+    v[l] = f * psij_const2[l];
+
+  for (l0 = 0; l0 < w; l0++)
+  {
+    const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
+    if (k0 < my_u0 || k0 > my_o0)
+      continue;
+    for (l1 = 0; l1 < w; l1++)
+    {
+      R *restrict gj = g + (k0 * n1 + i1[l1]) * n2;
+      const R p = psij_const0[l0] * psij_const1[l1];
+      if (u2 < o2)
+        for (l = 0; l < w; l++)
+          gj[u2 + l] += p * v[l];
+      else
+        for (l = 0; l < w; l++)
+          gj[i2[l]] += p * v[l];
+    }
+  }
+}
+
+/* the window values of node j, precomputed or evaluated into buf */
+static inline const R *real_psi(const X(plan) *ths, const INT j, R *buf)
+{
+  const INT w = 2 * ths->m + 2;
+
+  if (ths->flags & PRE_PSI)
+    return ths->psi + j * ths->d * w;
+
+  for (INT t = 0; t < ths->d; t++)
+  {
+    INT u, o;
+    uo(ths, j, &u, &o, t);
+    PHI_RUN(buf + t * w, ths->n[t], ths->x[j * ths->d + t], u, t);
+  }
+  return buf;
+}
+
+static void real_B_trafo(X(plan) *ths)
+{
+  const INT d = ths->d, m = ths->m, w = 2 * m + 2, *n = ths->n;
+  const R *g = (const R*)ths->g2;
+  INT k;
+
+  if (!(ths->flags & PRE_PSI))
+    sort(ths);
+
+#ifdef _OPENMP
+  #pragma omp parallel for default(shared) private(k)
+#endif
+  for (k = 0; k < ths->M_total; k++)
+  {
+    const INT j = (ths->flags & NFFT_SORT_NODES) ? ths->index_x[2 * k + 1] : k;
+    const R *x = ths->x + j * d;
+    R buf[3 * w], fj;
+    const R *psi = real_psi(ths, j, buf);
+
+    if (d == 2)
+    {
+      WITH_WIDTH(m, trafo_real_2d_w, &fj, g, psi, psi + w, x, x + 1, n[0], n[1])
+    }
+    else
+    {
+      WITH_WIDTH(m, trafo_real_3d_w, &fj, g, psi, psi + w, psi + 2 * w, x,
+          x + 1, x + 2, n[0], n[1], n[2])
+    }
+    ths->f[j] = fj;
+  }
+}
+
+/* the contribution of node j to the rows [my_u0, my_o0] of g */
+static inline void real_adjoint_node(const X(plan) *ths, R *g, const INT j,
+    const INT my_u0, const INT my_o0)
+{
+  const INT d = ths->d, m = ths->m, w = 2 * m + 2, *n = ths->n;
+  const R *x = ths->x + j * d, f = CREAL(ths->f[j]);
+  R buf[3 * w];
+  const R *psi = real_psi(ths, j, buf);
+
+  if (d == 2)
+  {
+    WITH_WIDTH(m, adjoint_real_2d_w, f, g, psi, psi + w, x, x + 1, n[0], n[1],
+        my_u0, my_o0)
+  }
+  else
+  {
+    WITH_WIDTH(m, adjoint_real_3d_w, f, g, psi, psi + w, psi + 2 * w, x, x + 1,
+        x + 2, n[0], n[1], n[2], my_u0, my_o0)
+  }
+}
+
+static void real_B_adjoint(X(plan) *ths)
+{
+  const INT M = ths->M_total;
+  R *g = (R*)ths->g2;
+  INT k;
+
+  memset(g, 0, (size_t)(ths->n_total) * sizeof(R));
+
+  if (!(ths->flags & PRE_PSI))
+    sort(ths);
+
+#ifdef _OPENMP
+  if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT)
+  {
+    #pragma omp parallel private(k)
+    {
+      const INT *ar_x = ths->index_x;
+      INT my_u0, my_o0, lo[2], hi[2];
+
+      nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &lo[0], &hi[0], &lo[1],
+          &hi[1], ths->d, ths->n, ths->m, ar_x, M);
+
+      for (INT part = 0; part < 2; part++)
+        if (lo[part] != -1)
+          for (k = index_x_binary_search(ar_x, M, lo[part]); k < M
+              && ar_x[2 * k] >= lo[part] && ar_x[2 * k] <= hi[part]; k++)
+            real_adjoint_node(ths, g, ar_x[2 * k + 1], my_u0, my_o0);
+    }
+    return;
+  }
+#endif
+
+  for (k = 0; k < M; k++)
+    real_adjoint_node(ths, g, k, 0, ths->n[0] - 1);
+}
+
+static void real_trafo(X(plan) *ths)
+{
+  ths->g_hat = ths->g1;
+  ths->g = ths->g2;
+
+  TIC(0)
+  real_D_trafo(ths);
+  TOC(0)
+
+  TIC_FFTW(1)
+  FFTW(execute)(ths->my_fftw_plan1);
+  TOC_FFTW(1)
+
+  TIC(2)
+  real_B_trafo(ths);
+  TOC(2)
+}
+
+static void real_adjoint(X(plan) *ths)
+{
+  ths->g_hat = ths->g1;
+  ths->g = ths->g2;
+
+  TIC(2)
+  real_B_adjoint(ths);
+  TOC(2)
+
+  TIC_FFTW(1)
+  FFTW(execute)(ths->my_fftw_plan2);
+  TOC_FFTW(1)
+
+  TIC(0)
+  real_D_adjoint(ths);
+  TOC(0)
+}
+
 void X(trafo)(X(plan) *ths)
 {
   /* use direct transform if degree N is too low */
@@ -5350,6 +5792,15 @@ void X(trafo)(X(plan) *ths)
     }
   }
   
+  if (ths->flags & NFFT_REAL)
+  {
+    if (ths->d == 2 || ths->d == 3)
+      real_trafo(ths);
+    else
+      X(trafo_direct)(ths);
+    return;
+  }
+
   switch(ths->d)
   {
     case 1: X(trafo_1d)(ths); break;
@@ -5398,6 +5849,15 @@ void X(adjoint)(X(plan) *ths)
     }
   }
   
+  if (ths->flags & NFFT_REAL)
+  {
+    if (ths->d == 2 || ths->d == 3)
+      real_adjoint(ths);
+    else
+      X(adjoint_direct)(ths);
+    return;
+  }
+
   switch(ths->d)
   {
     case 1: X(adjoint_1d)(ths); break;
@@ -5683,12 +6143,18 @@ static void init_help(X(plan) *ths)
   if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT)
     ths->flags |= NFFT_SORT_NODES;
 
+  /* a real plan transforms between the half lattice g1 and the real g2 */
+  if (ths->flags & NFFT_REAL)
+    ths->flags |= FFT_OUT_OF_PLACE;
+
   /* the pruned FFT needs the untouched zeros of an in-place transform */
   if (ths->d != 3 || (ths->flags & FFT_OUT_OF_PLACE) || !(ths->flags & FFTW_INIT))
     ths->flags &= ~NFFT_PRUNED_FFT;
   ths->my_fftw_plans_pruned = NULL;
 
   ths->N_total = intprod(ths->N, 0, ths->d);
+  if (ths->flags & NFFT_REAL)
+    ths->N_total = ths->N_total / ths->N[ths->d - 1] * (ths->N[ths->d - 1] / 2);
   ths->n_total = intprod(ths->n, 0, ths->d);
 
   ths->sigma = (R*) Y(malloc)((size_t)(ths->d) * sizeof(R));
@@ -5742,9 +6208,15 @@ static void init_help(X(plan) *ths)
     INT nthreads = Y(get_num_threads)();
 #endif
 
-    ths->g1 = (C*)Y(malloc)((size_t)(ths->n_total) * sizeof(C));
+    const INT nl = ths->n[ths->d - 1];
 
-    if(ths->flags & FFT_OUT_OF_PLACE)
+    /* a real plan keeps the half lattice in g1 and the real lattice in g2 */
+    ths->g1 = (C*)Y(malloc)((size_t)((ths->flags & NFFT_REAL)
+        ? ths->n_total / nl * (nl / 2 + 1) : ths->n_total) * sizeof(C));
+
+    if (ths->flags & NFFT_REAL)
+      ths->g2 = (C*)Y(malloc)((size_t)(ths->n_total) * sizeof(R));
+    else if(ths->flags & FFT_OUT_OF_PLACE)
       ths->g2 = (C*) Y(malloc)((size_t)(ths->n_total) * sizeof(C));
     else
       ths->g2 = ths->g1;
@@ -5762,8 +6234,16 @@ static void init_help(X(plan) *ths)
       for (t = 0; t < ths->d; t++)
         _n[t] = (int)(ths->n[t]);
 
-      ths->my_fftw_plan1 = FFTW(plan_dft)((int)ths->d, _n, ths->g1, ths->g2, FFTW_FORWARD, ths->fftw_flags);
-      ths->my_fftw_plan2 = FFTW(plan_dft)((int)ths->d, _n, ths->g2, ths->g1, FFTW_BACKWARD, ths->fftw_flags);
+      if (ths->flags & NFFT_REAL)
+      {
+        ths->my_fftw_plan1 = FFTW(plan_dft_c2r)((int)ths->d, _n, ths->g1, (R*)ths->g2, ths->fftw_flags);
+        ths->my_fftw_plan2 = FFTW(plan_dft_r2c)((int)ths->d, _n, (R*)ths->g2, ths->g1, ths->fftw_flags);
+      }
+      else
+      {
+        ths->my_fftw_plan1 = FFTW(plan_dft)((int)ths->d, _n, ths->g1, ths->g2, FFTW_FORWARD, ths->fftw_flags);
+        ths->my_fftw_plan2 = FFTW(plan_dft)((int)ths->d, _n, ths->g2, ths->g1, FFTW_BACKWARD, ths->fftw_flags);
+      }
       Y(free)(_n);
     }
 

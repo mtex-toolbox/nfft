@@ -115,15 +115,22 @@ static void complex_in(C *dst, const mxArray *a, const INT n, const char *err)
 #undef COMPLEX_IN
 }
 
-/* a complex n x 1 array of the plan's precision holding src */
-static mxArray *complex_out(const C *src, const INT n)
+/* an n x 1 array of the plan's precision holding src, or its real part */
+static mxArray *complex_out(const C *src, const INT n, const int re)
 {
   const mwSize dims[2] = {n, 1};
 #if defined(NFFT_SINGLE)
-  mxArray *a = mxCreateNumericArray(2, dims, mxSINGLE_CLASS, mxCOMPLEX);
+  mxArray *a = mxCreateNumericArray(2, dims, mxSINGLE_CLASS, re ? mxREAL : mxCOMPLEX);
 #else
-  mxArray *a = mxCreateNumericArray(2, dims, mxDOUBLE_CLASS, mxCOMPLEX);
+  mxArray *a = mxCreateNumericArray(2, dims, mxDOUBLE_CLASS, re ? mxREAL : mxCOMPLEX);
 #endif
+  if (re)
+  {
+    R *v = (R*)mxGetData(a);
+    for (INT k = 0; k < n; k++)
+      v[k] = CREAL(src[k]);
+    return a;
+  }
 #if MX_HAS_INTERLEAVED_COMPLEX
   memcpy(mxGetData(a), src, (size_t)n * sizeof(C));
 #else
@@ -441,7 +448,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     {
       int i = nfft_mex_get_int(prhs[1],"nfft: Input argument plan must be a scalar.");
       check_plan(i);
-      plhs[0] = complex_out(plans[i]->f, plans[i]->M_total);
+      plhs[0] = complex_out(plans[i]->f, plans[i]->M_total, plans[i]->flags & NFFT_REAL);
     }
     return;
   }
@@ -451,7 +458,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     {
       int i = nfft_mex_get_int(prhs[1],"nfft: Input argument plan must be a scalar.");
       check_plan(i);
-      plhs[0] = complex_out(plans[i]->f_hat, plans[i]->N_total);
+      plhs[0] = complex_out(plans[i]->f_hat, plans[i]->N_total, 0);
     }
     return;
   }
