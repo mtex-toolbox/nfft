@@ -75,12 +75,16 @@ static inline INT intprod(const INT *vec, const INT a, const INT d)
 static inline void sort0(const INT d, const INT *n, const INT m,
     const INT local_x_num, const R *local_x, INT *ar_x)
 {
-  INT u_j[d], i, j, help, rhigh;
+  INT i, j, rhigh;
   INT *ar_x_temp;
   INT nprod;
 
+#ifdef _OPENMP
+  #pragma omp parallel for default(shared) private(j)
+#endif
   for (i = 0; i < local_x_num; i++)
   {
+    INT u_j[d], help;
     ar_x[2 * i] = 0;
     ar_x[2 *i + 1] = i;
     for (j = 0; j < d; j++)
@@ -533,6 +537,21 @@ static inline void window_indices(INT *idx, const INT u, const INT n, const INT 
   for (INT l = 0; l < w; l++)
     idx[l] = u + l < n ? u + l : u + l - n;
 }
+
+/* calls f(..., m, 2m+2) with the window width a constant for the usual cutoffs,
+ * so that the kernels keep their w accumulators in registers */
+#define WITH_WIDTH(m, f, ...) \
+  switch (m) \
+  { \
+    case 2: f(__VA_ARGS__, 2, 6); break; \
+    case 3: f(__VA_ARGS__, 3, 8); break; \
+    case 4: f(__VA_ARGS__, 4, 10); break; \
+    case 5: f(__VA_ARGS__, 5, 12); break; \
+    case 6: f(__VA_ARGS__, 6, 14); break; \
+    case 7: f(__VA_ARGS__, 7, 16); break; \
+    case 8: f(__VA_ARGS__, 8, 18); break; \
+    default: f(__VA_ARGS__, m, 2 * (m) + 2); \
+  }
 
 static void fft_forward(X(plan) *ths);
 static void fft_backward(X(plan) *ths);
@@ -1490,6 +1509,8 @@ static inline INT index_x_binary_search(const INT *ar_x, const INT len, const IN
 #ifdef _OPENMP
 /**
  * Determines the blocks of vector g the current thread is responsible for.
+ * The rows of g are split so that about the same number of windows start in
+ * each thread's rows, which the sorted nodes ar_x give directly.
  *
  * \arg my_u0 lowest index (first component) the current threads writes to in g
  * \arg my_o0 highest index (first component) the current threads writes to in g
@@ -1500,68 +1521,44 @@ static inline INT index_x_binary_search(const INT *ar_x, const INT len, const IN
  * \arg d dimensionality
  * \arg n FFTW length
  * \arg m window length
+ * \arg ar_x nodes sorted by their linearized index u
+ * \arg M number of nodes
  *
  * \author Toni Volkmer
  */
 static void nfft_adjoint_B_omp_blockwise_init(INT *my_u0, INT *my_o0,
     INT *min_u_a, INT *max_u_a, INT *min_u_b, INT *max_u_b, const INT d,
-    const INT *n, const INT m)
+    const INT *n, const INT m, const INT *ar_x, const INT M)
 {
   const INT n0 = n[0];
-  INT k;
-  INT nthreads = omp_get_num_threads();
-  INT nthreads_used = MIN(nthreads, n0);
-  INT size_per_thread = n0 / nthreads_used;
-  INT size_left = n0 - size_per_thread * nthreads_used;
-  INT size_g[nthreads_used];
-  INT offset_g[nthreads_used];
-  INT my_id = omp_get_thread_num();
-  INT n_prod_rest = 1;
+  const INT nthreads = omp_get_num_threads();
+  const INT my_id = omp_get_thread_num();
+  const INT m22 = 2 * m + 2;
+  INT k, n_prod_rest = 1;
 
   for (k = 1; k < d; k++)
     n_prod_rest *= n[k];
+
+  /* first row of thread t */
+#define FIRST_ROW(t) ((t) == 0 || M == 0 ? 0 : (t) == nthreads ? n0 : \
+    ar_x[2 * (((t) * M) / nthreads)] / n_prod_rest)
+  *my_u0 = FIRST_ROW(my_id);
+  *my_o0 = FIRST_ROW(my_id + 1) - 1;
+#undef FIRST_ROW
 
   *min_u_a = -1;
   *max_u_a = -1;
   *min_u_b = -1;
   *max_u_b = -1;
-  *my_u0 = -1;
-  *my_o0 = -1;
 
-  if (my_id < nthreads_used)
+  if (*my_u0 <= *my_o0)
   {
-    const INT m22 = 2 * m + 2;
-
-    offset_g[0] = 0;
-    for (k = 0; k < nthreads_used; k++)
-    {
-      if (k > 0)
-        offset_g[k] = offset_g[k-1] + size_g[k-1];
-      size_g[k] = size_per_thread;
-      if (size_left > 0)
-      {
-        size_g[k]++;
-        size_left--;
-      }
-    }
-
-    *my_u0 = offset_g[my_id];
-    *my_o0 = offset_g[my_id] + size_g[my_id] - 1;
-
-    if (nthreads_used > 1)
-    {
-      *max_u_a = n_prod_rest*(offset_g[my_id] + size_g[my_id]) - 1;
-      *min_u_a = n_prod_rest*(offset_g[my_id] - m22 + 1);
-    }
-    else
-    {
-      *min_u_a = 0;
-      *max_u_a = n_prod_rest * n0 - 1;
-    }
+    *max_u_a = n_prod_rest * (*my_o0 + 1) - 1;
+    *min_u_a = n_prod_rest * (*my_u0 - m22 + 1);
 
     if (*min_u_a < 0)
     {
-      *min_u_b = n_prod_rest * (offset_g[my_id] - m22 + 1 + n0);
+      *min_u_b = n_prod_rest * (*my_u0 - m22 + 1 + n0);
       *max_u_b = n_prod_rest * n0 - 1;
       *min_u_a = 0;
     }
@@ -1622,7 +1619,7 @@ static void nfft_adjoint_B_compute_full_psi(C *g, const INT *psi_index_g,
       for (k = 1; k < d; k++)
         n_prod_rest *= n[k];
 
-      nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, &min_u_b, &max_u_b, d, n, m);
+      nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, &min_u_b, &max_u_b, d, n, m, ar_x, M);
 
       if (min_u_a != -1)
       {
@@ -1945,7 +1942,7 @@ MACRO_B(T)
         INT *ar_x = ths->index_x; \
  \
         nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, ths->d, ths->n, ths->m); \
+            &min_u_b, &max_u_b, ths->d, ths->n, ths->m, ar_x, ths->M_total); \
  \
         if (min_u_a != -1) \
         { \
@@ -2668,7 +2665,7 @@ static void nfft_trafo_1d_B(X(plan) *ths)
         INT *ar_x = ths->index_x; \
  \
         nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-        		                          &min_u_b, &max_u_b, 1, &n, m); \
+        		                          &min_u_b, &max_u_b, 1, &n, m, ar_x, ths->M_total); \
  \
         if (min_u_a != -1) \
         { \
@@ -3033,11 +3030,10 @@ void X(adjoint_1d)(X(plan) *ths)
 /* ################################################ SPECIFIC VERSIONS FOR d=2 */
 
 
-static void nfft_trafo_2d_compute(C *fj, const C *g, const R *psij_const0,
+static inline void trafo_2d_w(C *fj, const C *g, const R *psij_const0,
     const R *psij_const1, const R *xj0, const R *xj1, const INT n0,
-    const INT n1, const INT m)
+    const INT n1, const INT m, const INT w)
 {
-  const INT w = 2 * m + 2;
   INT u0, o0, u1, o1, l, l0;
   INT i0[w], i1[w];
   C t[w], sum = K(0.0);
@@ -3067,6 +3063,13 @@ static void nfft_trafo_2d_compute(C *fj, const C *g, const R *psij_const0,
     sum += psij_const1[l] * t[l];
 
   *fj = sum;
+}
+
+static void nfft_trafo_2d_compute(C *fj, const C *g, const R *psij_const0,
+    const R *psij_const1, const R *xj0, const R *xj1, const INT n0,
+    const INT n1, const INT m)
+{
+  WITH_WIDTH(m, trafo_2d_w, fj, g, psij_const0, psij_const1, xj0, xj1, n0, n1)
 }
 
 #ifdef _OPENMP
@@ -3127,18 +3130,21 @@ static void nfft_adjoint_2d_compute_omp_atomic(const C f, C *g,
  *
  * \author Toni Volkmer
  */
-static void nfft_adjoint_2d_compute_omp_blockwise(const C f, C *g,
+static inline void adjoint_2d_w(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *xj0, const R *xj1,
-    const INT n0, const INT n1, const INT m,
-    const INT my_u0, const INT my_o0)
+    const INT n0, const INT n1, const INT my_u0, const INT my_o0,
+    const INT m, const INT w)
 {
-  const INT w = 2 * m + 2;
   INT u0, o0, u1, o1, l, l0;
   INT i1[w];
+  C v[w];
 
   uo2(&u0, &o0, *xj0, n0, m);
   uo2(&u1, &o1, *xj1, n1, m);
   window_indices(i1, u1, n1, w);
+
+  for (l = 0; l < w; l++)
+    v[l] = f * psij_const1[l];
 
   /* only the rows k0 in [my_u0, my_o0] of the window belong to this thread */
   for (l0 = 0; l0 < w; l0++)
@@ -3147,14 +3153,23 @@ static void nfft_adjoint_2d_compute_omp_blockwise(const C f, C *g,
     if (k0 < my_u0 || k0 > my_o0)
       continue;
     C *restrict gj = g + k0 * n1;
-    const C f0 = f * psij_const0[l0];
+    const R p = psij_const0[l0];
     if (u1 < o1)
       for (l = 0; l < w; l++)
-        gj[u1 + l] += f0 * psij_const1[l];
+        gj[u1 + l] += p * v[l];
     else
       for (l = 0; l < w; l++)
-        gj[i1[l]] += f0 * psij_const1[l];
+        gj[i1[l]] += p * v[l];
   }
+}
+
+static void nfft_adjoint_2d_compute_omp_blockwise(const C f, C *g,
+    const R *psij_const0, const R *psij_const1, const R *xj0, const R *xj1,
+    const INT n0, const INT n1, const INT m,
+    const INT my_u0, const INT my_o0)
+{
+  WITH_WIDTH(m, adjoint_2d_w, f, g, psij_const0, psij_const1, xj0, xj1, n0, n1,
+      my_u0, my_o0)
 }
 #endif
 
@@ -3530,7 +3545,7 @@ static void nfft_trafo_2d_B(X(plan) *ths)
         INT *ar_x = ths->index_x; \
  \
         nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, 2, ths->n, m); \
+            &min_u_b, &max_u_b, 2, ths->n, m, ar_x, M); \
  \
         if (min_u_a != -1) \
         { \
@@ -3986,11 +4001,11 @@ void X(adjoint_2d)(X(plan) *ths)
 /* ################################################ SPECIFIC VERSIONS FOR d=3 */
 
 
-static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
+static inline void trafo_3d_w(C *fj, const C *g, const R *psij_const0,
     const R *psij_const1, const R *psij_const2, const R *xj0, const R *xj1,
-    const R *xj2, const INT n0, const INT n1, const INT n2, const INT m)
+    const R *xj2, const INT n0, const INT n1, const INT n2, const INT m,
+    const INT w)
 {
-  const INT w = 2 * m + 2;
   INT u0, o0, u1, o1, u2, o2, l, l0, l1;
   INT i0[w], i1[w], i2[w];
   C t[w], sum = K(0.0);
@@ -4026,6 +4041,14 @@ static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
   *fj = sum;
 }
 
+static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
+    const R *psij_const1, const R *psij_const2, const R *xj0, const R *xj1,
+    const R *xj2, const INT n0, const INT n1, const INT n2, const INT m)
+{
+  WITH_WIDTH(m, trafo_3d_w, fj, g, psij_const0, psij_const1, psij_const2, xj0,
+      xj1, xj2, n0, n1, n2)
+}
+
 #ifdef _OPENMP
 /** 
  * Adjoint NFFT for three-dimensional case updating only a specified range of
@@ -4048,15 +4071,15 @@ static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
  *
  * \author Toni Volkmer
  */
-static void nfft_adjoint_3d_compute_omp_blockwise(const C f, C *g,
+static inline void adjoint_3d_w(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *psij_const2,
     const R *xj0, const R *xj1, const R *xj2,
-    const INT n0, const INT n1, const INT n2, const INT m,
-    const INT my_u0, const INT my_o0)
+    const INT n0, const INT n1, const INT n2, const INT my_u0, const INT my_o0,
+    const INT m, const INT w)
 {
-  const INT w = 2 * m + 2;
   INT u0, o0, u1, o1, u2, o2, l, l0, l1;
   INT i1[w], i2[w];
+  C v[w];
 
   uo2(&u0, &o0, *xj0, n0, m);
   uo2(&u1, &o1, *xj1, n1, m);
@@ -4065,26 +4088,37 @@ static void nfft_adjoint_3d_compute_omp_blockwise(const C f, C *g,
   window_indices(i1, u1, n1, w);
   window_indices(i2, u2, n2, w);
 
+  for (l = 0; l < w; l++)
+    v[l] = f * psij_const2[l];
+
   /* only the rows k0 in [my_u0, my_o0] of the window belong to this thread */
   for (l0 = 0; l0 < w; l0++)
   {
     const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
     if (k0 < my_u0 || k0 > my_o0)
       continue;
-    const C f0 = f * psij_const0[l0];
-
     for (l1 = 0; l1 < w; l1++)
     {
       C *restrict gj = g + (k0 * n1 + i1[l1]) * n2;
-      const C f01 = f0 * psij_const1[l1];
+      const R p = psij_const0[l0] * psij_const1[l1];
       if (u2 < o2)
         for (l = 0; l < w; l++)
-          gj[u2 + l] += f01 * psij_const2[l];
+          gj[u2 + l] += p * v[l];
       else
         for (l = 0; l < w; l++)
-          gj[i2[l]] += f01 * psij_const2[l];
+          gj[i2[l]] += p * v[l];
     }
   }
+}
+
+static void nfft_adjoint_3d_compute_omp_blockwise(const C f, C *g,
+    const R *psij_const0, const R *psij_const1, const R *psij_const2,
+    const R *xj0, const R *xj1, const R *xj2,
+    const INT n0, const INT n1, const INT n2, const INT m,
+    const INT my_u0, const INT my_o0)
+{
+  WITH_WIDTH(m, adjoint_3d_w, f, g, psij_const0, psij_const1, psij_const2,
+      xj0, xj1, xj2, n0, n1, n2, my_u0, my_o0)
 }
 #endif
 
@@ -4745,7 +4779,7 @@ static void nfft_trafo_3d_B(X(plan) *ths)
         INT *ar_x = ths->index_x; \
  \
         nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, 3, ths->n, m); \
+            &min_u_b, &max_u_b, 3, ths->n, m, ar_x, M); \
  \
         if (min_u_a != -1) \
         { \
