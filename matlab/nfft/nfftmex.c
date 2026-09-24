@@ -15,6 +15,12 @@
  * this program; if not, write to the Free Software Foundation, Inc., 51
  * Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
+/* MATLAB passes f and f_hat in the interleaved complex API as they are stored
+ * in the plan, the helpers in ../args.c read real scalars only */
+#ifdef MATLAB_DEFAULT_RELEASE
+#undef MATLAB_DEFAULT_RELEASE
+#define MATLAB_DEFAULT_RELEASE R2018a
+#endif
 #include "config.h"
 
 #ifdef HAVE_COMPLEX_H
@@ -66,6 +72,69 @@ static inline void get_guru(const mxArray *prhs[], int d, int *N, int *M, int *n
   *f1 = mxGetScalar(mxGetCell(prhs[1], (unsigned int)(2*d+3)));
 
   *f2 = mxGetScalar(mxGetCell(prhs[1], (unsigned int)(2*d+4)));
+}
+
+#if MX_HAS_INTERLEAVED_COMPLEX
+MEXFUNCTION_LINKAGE
+void mexfilerequiredapiversion(unsigned int *built_by_rel, unsigned int *target_api_ver)
+{
+  *built_by_rel = 0x2018a;
+  *target_api_ver = MX_TARGET_API_VER;
+}
+#endif
+
+/* copies the n values of a double or single, real or complex array to dst */
+static void complex_in(C *dst, const mxArray *a, const INT n, const char *err)
+{
+  const int cplx = mxIsComplex(a);
+#if MX_HAS_INTERLEAVED_COMPLEX
+#define COMPLEX_IN(T) \
+  { \
+    const T *v = (const T*)mxGetData(a); \
+    if (cplx) \
+      for (INT k = 0; k < n; k++) dst[k] = v[2 * k] + I * v[2 * k + 1]; \
+    else \
+      for (INT k = 0; k < n; k++) dst[k] = v[k]; \
+  }
+#else
+#define COMPLEX_IN(T) \
+  { \
+    const T *re = (const T*)mxGetData(a), *im = (const T*)mxGetImagData(a); \
+    if (cplx) \
+      for (INT k = 0; k < n; k++) dst[k] = re[k] + I * im[k]; \
+    else \
+      for (INT k = 0; k < n; k++) dst[k] = re[k]; \
+  }
+#endif
+  if (mxIsDouble(a))
+    COMPLEX_IN(double)
+  else if (mxIsSingle(a))
+    COMPLEX_IN(float)
+  else
+    DM(mexErrMsgTxt(err);)
+#undef COMPLEX_IN
+}
+
+/* a complex n x 1 array of the plan's precision holding src */
+static mxArray *complex_out(const C *src, const INT n)
+{
+  const mwSize dims[2] = {n, 1};
+#if defined(NFFT_SINGLE)
+  mxArray *a = mxCreateNumericArray(2, dims, mxSINGLE_CLASS, mxCOMPLEX);
+#else
+  mxArray *a = mxCreateNumericArray(2, dims, mxDOUBLE_CLASS, mxCOMPLEX);
+#endif
+#if MX_HAS_INTERLEAVED_COMPLEX
+  memcpy(mxGetData(a), src, (size_t)n * sizeof(C));
+#else
+  R *re = (R*)mxGetData(a), *im = (R*)mxGetImagData(a);
+  for (INT k = 0; k < n; k++)
+  {
+    re[k] = CREAL(src[k]);
+    im[k] = CIMAG(src[k]);
+  }
+#endif
+  return a;
 }
 
 static inline void check_plan(int i)
@@ -371,25 +440,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     nfft_mex_check_nargs(nrhs,2,"Wrong number of arguments for get_f.");
     {
       int i = nfft_mex_get_int(prhs[1],"nfft: Input argument plan must be a scalar.");
-      int m;
       check_plan(i);
-      m = plans[i]->M_total;
-      const mwSize dims[2] = {m, 1};
-#if defined(NFFT_SINGLE)
-      plhs[0] = mxCreateNumericArray(2, dims, mxSINGLE_CLASS, mxCOMPLEX);
-      float *fr = (float*)mxGetData(plhs[0]), *fi = (float*)mxGetImagData(plhs[0]);
-#else
-      plhs[0] = mxCreateNumericArray(2, dims, mxDOUBLE_CLASS, mxCOMPLEX);
-      double *fr = (double*)mxGetData(plhs[0]), *fi = (double*)mxGetImagData(plhs[0]);
-#endif
-      {
-        int j;
-        for (j = 0; j < m; j++)
-        {
-          fr[j] = CREAL(plans[i]->f[j]);
-          fi[j] = CIMAG(plans[i]->f[j]);
-        }
-      }
+      plhs[0] = complex_out(plans[i]->f, plans[i]->M_total);
     }
     return;
   }
@@ -398,25 +450,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     nfft_mex_check_nargs(nrhs,2,"Wrong number of arguments for get_f_hat.");
     {
       int i = nfft_mex_get_int(prhs[1],"nfft: Input argument plan must be a scalar.");
-      int n;
       check_plan(i);
-      n = plans[i]->N_total;
-      const mwSize dims[2] = {n, 1};
-#if defined(NFFT_SINGLE)
-      plhs[0] = mxCreateNumericArray(2, dims, mxSINGLE_CLASS, mxCOMPLEX);
-      float *f_hatr = (float*)mxGetData(plhs[0]), *f_hati = (float*)mxGetImagData(plhs[0]);
-#else
-      plhs[0] = mxCreateNumericArray(2, dims, mxDOUBLE_CLASS, mxCOMPLEX);
-      double *f_hatr = (double*)mxGetData(plhs[0]), *f_hati = (double*)mxGetImagData(plhs[0]);
-#endif
-      {
-        int k;
-        for (k = 0; k < n; k++)
-        {
-          f_hatr[k] = CREAL(plans[i]->f_hat[k]);
-          f_hati[k] = CIMAG(plans[i]->f_hat[k]);
-        }
-      }
+      plhs[0] = complex_out(plans[i]->f_hat, plans[i]->N_total);
     }
     return;
   }
@@ -462,28 +497,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
       m = plans[i]->M_total;
       DM(if (mxGetM(prhs[2]) * mxGetN(prhs[2]) != (unsigned int)m)
         mexErrMsgTxt("Input argument f must have correct size.");)
-      if (mxIsDouble(prhs[2]))
-      {
-        double *fr = mxGetPr(prhs[2]), *fi = mxGetPi(prhs[2]);
-        if (fi)
-          for (int j = 0; j < m; j++)
-            plans[i]->f[j] = fr[j] + I*fi[j];
-        else
-          for (int j = 0; j < m; j++)
-            plans[i]->f[j] = fr[j];
-      }
-      else if (mxIsSingle(prhs[2]))
-      {
-        float *fr = (float*)mxGetData(prhs[2]), *fi = (float*)mxGetImagData(prhs[2]);
-        if (fi)
-          for (int j = 0; j < m; j++)
-            plans[i]->f[j] = fr[j] + I*fi[j];
-        else
-          for (int j = 0; j < m; j++)
-            plans[i]->f[j] = fr[j];
-      }
-      else
-        DM(mexErrMsgTxt("Input argument f must be a double array");)
+      complex_in(plans[i]->f, prhs[2], m, "Input argument f must be a double array");
     }
     return;
   }
@@ -497,28 +511,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
       n = plans[i]->N_total;
       DM(if (   mxGetM(prhs[2]) != (unsigned int)n || mxGetN(prhs[2]) != 1)
         mexErrMsgTxt("Input argument f_hat must have correct size.");)
-      if (mxIsDouble(prhs[2]))
-      {
-        double *f_hatr = mxGetPr(prhs[2]), *f_hati = mxGetPi(prhs[2]);
-        if (f_hati)
-          for (int k = 0; k < n; k++)
-            plans[i]->f_hat[k] = f_hatr[k] + I*f_hati[k];
-        else
-          for (int k = 0; k < n; k++)
-            plans[i]->f_hat[k] = f_hatr[k];
-      }
-      else if (mxIsSingle(prhs[2]))
-      {
-        float *f_hatr = (float*)mxGetData(prhs[2]), *f_hati = (float*)mxGetImagData(prhs[2]);
-        if (f_hati)
-          for (int k = 0; k < n; k++)
-            plans[i]->f_hat[k] = f_hatr[k] + I*f_hati[k];
-        else
-          for (int k = 0; k < n; k++)
-            plans[i]->f_hat[k] = f_hatr[k];
-      }
-      else
-        DM(mexErrMsgTxt("Input argument f_hat must be a double array");)
+      complex_in(plans[i]->f_hat, prhs[2], n, "Input argument f_hat must be a double array");
     }
     return;
   }
