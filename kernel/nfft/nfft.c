@@ -5718,7 +5718,9 @@ static void init_help(X(plan) *ths)
 #if defined(_OPENMP) && defined(HAVE_FFTW_THREADS)
 #pragma omp critical (nfft_omp_critical_fftw_plan)
 {
-    FFTW(plan_with_nthreads)(nthreads);
+    /* below about 2^20 points the threaded FFTW plans take longer to create
+     * than their threads save */
+    FFTW(plan_with_nthreads)(ths->n_total < (1 << 20) ? 1 : nthreads);
 #endif
     {
       int *_n = Y(malloc)((size_t)(ths->d) * sizeof(int));
