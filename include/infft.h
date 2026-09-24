@@ -334,7 +334,11 @@ typedef ptrdiff_t INT;
    * 1 / (exp(-m b) * I0(m b)) and 1 / I0(m b). The last two are the peak in the
    * two forms the window needs it in; both are constant per axis, so neither
    * costs a Bessel evaluation inside a loop. The second follows from the first,
-   * since log I0(m b) is m b + lg_tail. */
+   * since log I0(m b) is m b + lg_tail. After them follows per axis the
+   * polynomial table of Y(kb_poly_init), KB_POLY_SIZE reals. */
+  #define KB_POLY_DMAX 28
+  #define KB_POLY_SIZE(m) (1 + (KB_POLY_DMAX + 1) * (2 * (m) + 2))
+  #define KB_POLY(ax) (ths->b + 4 * (ths->d) + (ax) * KB_POLY_SIZE(ths->m))
   #define KB_B(ax) (ths->b[(ax)])
   #define KB_LG_TAIL(ax) (ths->b[(ths->d) + (ax)])
   #define KB_I0E_PEAK_INV(ax) (ths->b[2 * (ths->d) + (ax)])
@@ -344,16 +348,15 @@ typedef ptrdiff_t INT;
   #define PHI(n,x,ax) (Y(kb_phi)(KB_B(ax), KB_LG_TAIL(ax), KB_PEAK_INV(ax), \
                          (R)(ths->m), (R)(n) * (R)(x)))
   /* Fills dst[0 .. 2m+1] with phi(x - (u + l)/n), the run every psi table is
-   * built from. The window sees the whole run, so it can hoist its constants,
-   * step the argument by one grid cell rather than dividing per point, and put
-   * the points that need the guarded evaluation in their own branch. */
+   * built from, from the polynomial table where it applies. */
   #define PHI_RUN(dst,n,x,u,ax) \
-    Y(kb_phi_run)((dst), KB_B(ax), KB_LG_TAIL(ax), KB_PEAK_INV(ax), \
+    Y(kb_run)((dst), KB_POLY(ax), KB_B(ax), KB_LG_TAIL(ax), KB_PEAK_INV(ax), \
         (R)(ths->m), (ths->m), NX_SUB(n, x, u))
   #define WINDOW_HELP_INIT \
     { \
       int WINDOW_idx; \
-      ths->b = (R*) Y(malloc)((size_t)(4 * ths->d) * sizeof(R)); \
+      ths->b = (R*) Y(malloc)((size_t)(4 * ths->d + ths->d * \
+          KB_POLY_SIZE(ths->m)) * sizeof(R)); \
       for (WINDOW_idx = 0; WINDOW_idx < ths->d; WINDOW_idx++) \
       { \
         R WINDOW_b = (KPI * (K(2.0) - K(1.0) / ths->sigma[WINDOW_idx])); \
@@ -364,6 +367,12 @@ typedef ptrdiff_t INT;
         ths->b[2 * ths->d + WINDOW_idx] = K(1.0) / \
             Y(bessel_i0_exp_scaled)(WINDOW_xpk); \
         ths->b[3 * ths->d + WINDOW_idx] = EXP(-WINDOW_xpk - WINDOW_lg); \
+        if (WINDOW_idx > 0 && WINDOW_b == ths->b[WINDOW_idx - 1]) \
+          memcpy(KB_POLY(WINDOW_idx), KB_POLY(WINDOW_idx - 1), \
+              (size_t)KB_POLY_SIZE(ths->m) * sizeof(R)); \
+        else \
+          Y(kb_poly_init)(KB_POLY(WINDOW_idx), WINDOW_b, WINDOW_lg, \
+              ths->b[3 * ths->d + WINDOW_idx], ths->m); \
       } \
   }
   #define WINDOW_HELP_FINALIZE {Y(free)(ths->b);}
@@ -1743,6 +1752,26 @@ static inline void Y(kb_phi_run)(R *dst, R b, R lg_tail, R peak_inv, R m,
 
   for (l = hi + 1; l <= last; l++)
     dst[l] = Y(kb_phi)(b, lg_tail, peak_inv, m, nx0 - (R)l);
+}
+
+/* window.c: the run phi(m + t - l), l = 0 .. 2m+1, as polynomials of degree D
+ * in s = 2t - 1 for t in [0, 1]. poly[0] holds D, or -1 where no degree up to
+ * KB_POLY_DMAX meets the precision, and poly[1 + k (2m+2) + l] the coefficient
+ * of s^k of the l-th value. */
+void Y(kb_poly_init)(R *poly, R b, R lg_tail, R peak_inv, INT m);
+void Y(kb_poly_run)(R *dst, const R *c, INT D, INT w, R s);
+
+/* The run starting at nx0 = n x - u. Every caller's u = floor(n x) - m puts t =
+ * nx0 - m in [0, 1), where the polynomials hold; any other run is exact. */
+static inline void Y(kb_run)(R *dst, const R *poly, R b, R lg_tail,
+  R peak_inv, R m, INT mi, R nx0)
+{
+  const R t = nx0 - m;
+
+  if (poly[0] >= K(0.0) && t >= K(0.0) && t <= K(1.0))
+    Y(kb_poly_run)(dst, poly + 1, (INT)poly[0], 2 * mi + 2, K(2.0) * t - K(1.0));
+  else
+    Y(kb_phi_run)(dst, b, lg_tail, peak_inv, m, mi, nx0);
 }
 
 /* I0(a)/I0(m b) with a = m sqrt(b^2 - t^2), t = 2 pi k / n. Both exponentially
