@@ -71,12 +71,18 @@ jobs:
         run: |
           brew install fftw libomp ninja
           # omp.h from Homebrew, but the runtime MATLAB ships: a second OpenMP
-          # runtime in the MATLAB process fails to initialise
-          lib=$(ls "$MATLAB_ROOT/bin/${{ matrix.arch }}"/lib{omp,iomp5}.dylib 2>/dev/null | head -1)
-          [ -n "$lib" ] || { echo "no OpenMP runtime in MATLAB"; exit 1; }
-          echo "MATLAB OpenMP runtime: $lib"
-          echo "OMP_ARGS=-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
-          echo "OMP_LIB=$lib" >> "$GITHUB_ENV"
+          # runtime in the MATLAB process fails to initialise. Without one in
+          # MATLAB the mex is built single threaded.
+          lib=$(find "$MATLAB_ROOT/bin/${{ matrix.arch }}" "$MATLAB_ROOT/sys/os/${{ matrix.arch }}" \
+                -name 'libomp.dylib' -o -name 'libiomp5.dylib' 2>/dev/null | head -1)
+          if [ -n "$lib" ]; then
+            echo "MATLAB OpenMP runtime: $lib"
+            echo "OMP_ARGS=-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
+            echo "OMP_LIB=$lib" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no OpenMP runtime in MATLAB, nfftmex.${{ matrix.ext }} is single threaded"
+            echo "THREADS=OFF" >> "$GITHUB_ENV"
+          fi
 
       - name: tools (Windows)
         if: runner.os == 'Windows'
@@ -94,14 +100,17 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          omp=()
+          # the mex uses MATLAB's FFTW: a threaded system FFTW would only bring
+          # its own OpenMP runtime into CMake's run check
+          omp=(-DFFTW3_OMP_LIBRARY=OFF)
           if [ -n "$OMP_LIB" ]; then
-            omp=("$OMP_ARGS" -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$OMP_LIB")
+            omp+=("$OMP_ARGS" -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$OMP_LIB")
           fi
+          t=${THREADS:-ON}
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
             -DNFFT_WITH_MATLAB="$MATLAB_ROOT" \
-            -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON \
+            -DNFFT_ENABLE_OPENMP=$t -DNFFT_ENABLE_MATLAB_THREADS=$t \
             "${omp[@]}"
           cmake --build build --target matlab_nfftmex
 

@@ -90,7 +90,9 @@ function(nfft_add_matlab_mex module source)
   target_include_directories(${tgt} PRIVATE
     ${NFFT_GENERATED_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/matlab ${Matlab_INCLUDE_DIRS} ${MX_EXTRA_INC})
-  set_target_properties(${tgt} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${outdir}")
+  # a mex is a runtime output (DLL) on Windows, a library output elsewhere
+  set_target_properties(${tgt} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${outdir}"
+    RUNTIME_OUTPUT_DIRECTORY "${outdir}")
 
   file(GLOB _m "${PROJECT_SOURCE_DIR}/matlab/${module}/*.m")
   add_custom_command(TARGET ${tgt} POST_BUILD
