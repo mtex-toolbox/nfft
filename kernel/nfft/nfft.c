@@ -1622,12 +1622,20 @@ static INT slab_rows(INT *row, const INT nb_want, const INT n0, const INT w,
     const INT npr1_ = npr_ / n1_; \
     for (INT phase_ = 0; phase_ < 4; phase_++) \
     { \
-      _Pragma("omp parallel for schedule(dynamic)") \
-      for (INT c_ = 0; c_ < nb0_ * nb1_; c_++) \
+      /* the tiles of this parity, handed out by a counter: a dynamic schedule \
+       * without the runtime's dispatch calls, which older runtimes lack */ \
+      const INT p0_ = phase_ % 2, p1_ = phase_ / 2; \
+      const INT n1p_ = (nb1_ - p1_ + 1) / 2, ntp_ = (nb0_ - p0_ + 1) / 2 * n1p_; \
+      INT next_ = 0; \
+      _Pragma("omp parallel") \
+      for (;;) \
       { \
-        const INT c0_ = c_ / nb1_, c1_ = c_ % nb1_; \
-        if (c0_ % 2 + 2 * (c1_ % 2) != phase_) \
-          continue; \
+        INT t_; \
+        _Pragma("omp atomic capture") \
+        t_ = next_++; \
+        if (t_ >= ntp_) \
+          break; \
+        const INT c0_ = p0_ + 2 * (t_ / n1p_), c1_ = p1_ + 2 * (t_ % n1p_); \
         for (INT u_ = row_[c0_]; u_ < row_[c0_ + 1]; u_++) \
         { \
           const INT lo_ = u_ * npr_ + c1_ * n1_ / nb1_ * npr1_; \

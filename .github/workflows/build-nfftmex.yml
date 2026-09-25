@@ -118,11 +118,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
-          # -static links the MinGW runtimes (libgcc, libgomp, winpthread) into
-          # the mex, which must load without MSYS2 on the PATH
+          # the MinGW runtimes (libgcc, libgomp, winpthread) go into the mex,
+          # which must load without MSYS2: -static alone keeps the import
+          # library of libgomp that FindOpenMP names
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
             -DCMAKE_SHARED_LINKER_FLAGS=-static -DCMAKE_MODULE_LINKER_FLAGS=-static \
+            -DOpenMP_gomp_LIBRARY="$(gcc -print-file-name=libgomp.a)" \
+            -DOpenMP_pthread_LIBRARY="$(gcc -print-file-name=libwinpthread.a)" \
+            -DFFTW3_OMP_LIBRARY=OFF \
             -DNFFT_WITH_MATLAB="$MATLAB_ROOT" \
             -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON
           cmake --build build --target matlab_nfftmex
@@ -134,6 +138,10 @@ jobs:
           f=build/matlab/nfft/nfftmex.${{ matrix.ext }}
           ls -la "$f"
           if [ "${{ runner.os }}" = Linux ]; then ldd "$f"; else otool -L "$f"; fi
+          # nothing a MATLAB user would lack: no Homebrew library on macOS
+          if [ "${{ runner.os }}" = macOS ] && otool -L "$f" | grep -qE "/opt/homebrew|/usr/local"; then
+            echo "::error::nfftmex depends on a Homebrew library"; exit 1
+          fi
 
       - name: dynamic dependencies (Windows)
         if: runner.os == 'Windows'
@@ -142,6 +150,10 @@ jobs:
           f=build/matlab/nfft/nfftmex.${{ matrix.ext }}
           ls -la "$f"
           objdump -p "$f" | grep "DLL Name"
+          # only system and MATLAB DLLs, no MinGW runtime
+          if objdump -p "$f" | grep -qiE "DLL Name: (libgomp|libwinpthread|libgcc)"; then
+            echo "::error::nfftmex depends on a MinGW runtime DLL"; exit 1
+          fi
 
       - name: smoke test in MATLAB
         uses: matlab-actions/run-command@v2
