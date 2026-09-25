@@ -1577,75 +1577,72 @@ static inline INT index_x_binary_search(const INT *ar_x, const INT len, const IN
 #endif
 
 #ifdef _OPENMP
-/**
- * Determines the blocks of vector g the current thread is responsible for.
- * The rows of g are split so that about the same number of windows start in
- * each thread's rows, which the sorted nodes ar_x give directly.
- *
- * \arg my_u0 lowest index (first component) the current threads writes to in g
- * \arg my_o0 highest index (first component) the current threads writes to in g
- * \arg min_u_a lowest (linearized) index u which could lead to writing to g
- * \arg max_u_a highest (linearized) index u which could lead to writing to g
- * \arg min_u_b lowest (linearized) index u which could lead to writing to g
- * \arg max_u_b highest (linearized) index u which could lead to writing to g
- * \arg d dimensionality
- * \arg n FFTW length
- * \arg m window length
- * \arg ar_x nodes sorted by their linearized index u
- * \arg M number of nodes
- *
- * \author Toni Volkmer
- */
-static void nfft_adjoint_B_omp_blockwise_init(INT *my_u0, INT *my_o0,
-    INT *min_u_a, INT *max_u_a, INT *min_u_b, INT *max_u_b, const INT d,
-    const INT *n, const INT m, const INT *ar_x, const INT M)
+/* First rows row[0..nb] of nb slabs of the rows of g, about the same number of
+ * windows starting in each, every slab at least w - 1 rows high and nb even -
+ * or 1 slab if the lattice is too small for two. */
+static INT slab_rows(INT *row, const INT nb_want, const INT n0, const INT w,
+    const INT n_prod_rest, const INT *ar_x, const INT M)
 {
-  const INT n0 = n[0];
-  const INT nthreads = omp_get_num_threads();
-  const INT my_id = omp_get_thread_num();
-  const INT m22 = 2 * m + 2;
-  INT k, n_prod_rest = 1;
-
-  for (k = 1; k < d; k++)
-    n_prod_rest *= n[k];
-
-  /* first row of thread t */
-#define FIRST_ROW(t) ((t) == 0 || M == 0 ? 0 : (t) == nthreads ? n0 : \
-    ar_x[2 * (((t) * M) / nthreads)] / n_prod_rest)
-  *my_u0 = FIRST_ROW(my_id);
-  *my_o0 = FIRST_ROW(my_id + 1) - 1;
-#undef FIRST_ROW
-
-  *min_u_a = -1;
-  *max_u_a = -1;
-  *min_u_b = -1;
-  *max_u_b = -1;
-
-  if (*my_u0 <= *my_o0)
+  INT nb = MIN(nb_want, n0 / (w - 1));
+  nb -= nb % 2;
+  row[0] = 0;
+  if (nb < 2)
   {
-    *max_u_a = n_prod_rest * (*my_o0 + 1) - 1;
-    *min_u_a = n_prod_rest * (*my_u0 - m22 + 1);
-
-    if (*min_u_a < 0)
-    {
-      *min_u_b = n_prod_rest * (*my_u0 - m22 + 1 + n0);
-      *max_u_b = n_prod_rest * n0 - 1;
-      *min_u_a = 0;
-    }
-
-    if (*min_u_b != -1 && *min_u_b <= *max_u_a)
-    {
-      *max_u_a = *max_u_b;
-      *min_u_b = -1;
-      *max_u_b = -1;
-    }
-#ifdef OMP_ASSERT
-    assert(*min_u_a <= *max_u_a);
-    assert(*min_u_b <= *max_u_b);
-    assert(*min_u_b == -1 || *max_u_a < *min_u_b);
-#endif
+    row[1] = n0;
+    return 1;
   }
+  for (INT t = 1; t < nb; t++)
+  {
+    const INT r = M ? ar_x[2 * ((t * M) / nb)] / n_prod_rest : 0;
+    row[t] = MIN(MAX(r, row[t - 1] + w - 1), n0 - (nb - t) * (w - 1));
+  }
+  row[nb] = n0;
+  return nb;
 }
+
+/* Runs the body for every node j of the adjoint, taken in sorted order by the
+ * tile of rows of g its window starts in: slab_rows in dimension 0 and equal
+ * slabs of at least w - 1 rows in dimension 1. A window reaches at most w - 1
+ * rows past its tile in both, so tiles two apart in either dimension write
+ * disjoint parts of g: the tiles of one of the four parities run in parallel,
+ * and more tiles than threads in a dynamic schedule even out cores of
+ * different speed. */
+#define ADJOINT_TILES(d_, n_, m_, ar_x_, M_, ...) \
+  { \
+    const INT nt_ = omp_get_max_threads(), w_ = 2 * (m_) + 2; \
+    const INT n1_ = (d_) > 1 ? (n_)[1] : 1; \
+    INT npr_ = 1, row_[4 * nt_ + 1], nb1_; \
+    for (INT t_ = 1; t_ < (d_); t_++) \
+      npr_ *= (n_)[t_]; \
+    const INT nb0_ = slab_rows(row_, 4 * nt_, (n_)[0], w_, npr_, (ar_x_), (M_)); \
+    nb1_ = (d_) > 1 ? MIN(n1_ / (w_ - 1), (16 * nt_ + nb0_ - 1) / nb0_) : 1; \
+    nb1_ -= nb1_ % 2; \
+    if (nb1_ < 2) \
+      nb1_ = 1; \
+    const INT npr1_ = npr_ / n1_; \
+    for (INT phase_ = 0; phase_ < 4; phase_++) \
+    { \
+      _Pragma("omp parallel for schedule(dynamic)") \
+      for (INT c_ = 0; c_ < nb0_ * nb1_; c_++) \
+      { \
+        const INT c0_ = c_ / nb1_, c1_ = c_ % nb1_; \
+        if (c0_ % 2 + 2 * (c1_ % 2) != phase_) \
+          continue; \
+        for (INT u_ = row_[c0_]; u_ < row_[c0_ + 1]; u_++) \
+        { \
+          const INT lo_ = u_ * npr_ + c1_ * n1_ / nb1_ * npr1_; \
+          const INT hi_ = u_ * npr_ + (c1_ + 1) * n1_ / nb1_ * npr1_; \
+          for (INT k_ = index_x_binary_search((ar_x_), (M_), lo_); \
+              k_ < (M_) && (ar_x_)[2 * k_] < hi_; k_++) \
+            if ((ar_x_)[2 * k_] >= lo_) \
+            { \
+              const INT j = (ar_x_)[2 * k_ + 1]; \
+              __VA_ARGS__ \
+            } \
+        } \
+      } \
+    } \
+  }
 #endif
 
 /**
@@ -1662,9 +1659,6 @@ static void nfft_adjoint_B_compute_full_psi(C *g, const INT *psi_index_g,
 {
   INT k;
   INT lprod;
-#ifdef _OPENMP
-  INT lprod_m1;
-#endif
 #ifndef _OPENMP
   UNUSED(n);
 #endif
@@ -1673,95 +1667,15 @@ static void nfft_adjoint_B_compute_full_psi(C *g, const INT *psi_index_g,
     for(t = 0, lprod = 1; t < d; t++)
         lprod *= 2 * m + 2;
   }
-#ifdef _OPENMP
-  lprod_m1 = lprod / (2 * m + 2);
-#endif
 
 #ifdef _OPENMP
   if (flags & NFFT_OMP_BLOCKWISE_ADJOINT)
   {
-    #pragma omp parallel private(k)
-    {
-      INT my_u0, my_o0, min_u_a, max_u_a, min_u_b, max_u_b;
-      const INT *ar_x = index_x;
-      INT n_prod_rest = 1;
-
-      for (k = 1; k < d; k++)
-        n_prod_rest *= n[k];
-
-      nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, &min_u_b, &max_u_b, d, n, m, ar_x, M);
-
-      if (min_u_a != -1)
-      {
-        k = index_x_binary_search(ar_x, M, min_u_a);
-#ifdef OMP_ASSERT
-        assert(ar_x[2*k] >= min_u_a || k == M-1);
-        if (k > 0)
-          assert(ar_x[2*k-2] < min_u_a);
-#endif
-        while (k < M)
-        {
-          INT l0, lrest;
-          INT u_prod = ar_x[2*k];
-          INT j = ar_x[2*k+1];
-
-          if (u_prod < min_u_a || u_prod > max_u_a)
-            break;
-
-          for (l0 = 0; l0 < 2 * m + 2; l0++)
-          {
-            const INT start_index = psi_index_g[j * lprod + l0 * lprod_m1];
-
-            if (start_index < my_u0 * n_prod_rest || start_index > (my_o0+1) * n_prod_rest - 1)
-              continue;
-
-            for (lrest = 0; lrest < lprod_m1; lrest++)
-            {
-              const INT l = l0 * lprod_m1 + lrest;
-              g[psi_index_g[j * lprod + l]] += psi[j * lprod + l] * f[j];
-            }
-          }
-
-          k++;
-        }
-      }
-
-      if (min_u_b != -1)
-      {
-        k = index_x_binary_search(ar_x, M, min_u_b);
-#ifdef OMP_ASSERT
-        assert(ar_x[2*k] >= min_u_b || k == M-1);
-        if (k > 0)
-          assert(ar_x[2*k-2] < min_u_b);
-#endif
-        while (k < M)
-        {
-          INT l0, lrest;
-          INT u_prod = ar_x[2*k];
-          INT j = ar_x[2*k+1];
-
-          if (u_prod < min_u_b || u_prod > max_u_b)
-            break;
-
-          for (l0 = 0; l0 < 2 * m + 2; l0++)
-          {
-            const INT start_index = psi_index_g[j * lprod + l0 * lprod_m1];
-
-            if (start_index < my_u0 * n_prod_rest || start_index > (my_o0+1) * n_prod_rest - 1)
-              continue;
-            for (lrest = 0; lrest < lprod_m1; lrest++)
-            {
-              const INT l = l0 * lprod_m1 + lrest;
-              g[psi_index_g[j * lprod + l]] += psi[j * lprod + l] * f[j];
-            }
-          }
-
-          k++;
-        }
-      }
-    } /* omp parallel */
+    ADJOINT_TILES(d, n, m, index_x, M,
+      for (INT l = 0; l < lprod; l++)
+        g[psi_index_g[j * lprod + l]] += psi[j * lprod + l] * f[j];)
     return;
-  } /* if(NFFT_OMP_BLOCKWISE_ADJOINT) */
+  }
 #endif
 
 #ifdef _OPENMP
@@ -1798,27 +1712,6 @@ MACRO_B(T)
 
 #ifdef _OPENMP
 
-#ifdef OMP_ASSERT
-#define MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A \
-{ \
-          assert(ar_x[2*k] >= min_u_a || k == M-1); \
-          if (k > 0) \
-            assert(ar_x[2*k-2] < min_u_a); \
-}
-#else
-#define MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A
-#endif
-
-#ifdef OMP_ASSERT
-#define MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B \
-{ \
-          assert(ar_x[2*k] >= min_u_b || k == M-1); \
-          if (k > 0) \
-            assert(ar_x[2*k-2] < min_u_b); \
-}
-#else
-#define MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B
-#endif
 
 #define MACRO_adjoint_nd_B_OMP_COMPUTE_BEFORE_LOOP_with_PRE_PSI
 #define MACRO_adjoint_nd_B_OMP_COMPUTE_UPDATE_with_PRE_PSI \
@@ -2004,58 +1897,13 @@ MACRO_B(T)
     if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT) \
     { \
       INT lprodrest = 1; \
+      const INT my_u0 = 0, my_o0 = ths->n[0] - 1; \
       for (k = 1; k < ths->d; k++) \
         lprodrest *= (2*ths->m+2); \
-      _Pragma("omp parallel private(k)") \
-      { \
-        INT my_u0, my_o0, min_u_a, max_u_a, min_u_b, max_u_b; \
-        INT *ar_x = ths->index_x; \
- \
-        nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, ths->d, ths->n, ths->m, ar_x, ths->M_total); \
- \
-        if (min_u_a != -1) \
-        { \
-          k = index_x_binary_search(ar_x, ths->M_total, min_u_a); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A \
- \
-          while (k < ths->M_total) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_a || u_prod > max_u_a) \
-              break; \
- \
-            MACRO_adjoint_nd_B_OMP_BLOCKWISE_COMPUTE(whichone) \
- \
-            k++; \
-          } \
-        } \
- \
-        if (min_u_b != -1) \
-        { \
-          INT k = index_x_binary_search(ar_x, ths->M_total, min_u_b); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B \
- \
-          while (k < ths->M_total) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_b || u_prod > max_u_b) \
-              break; \
- \
-            MACRO_adjoint_nd_B_OMP_BLOCKWISE_COMPUTE(whichone) \
- \
-            k++; \
-          } \
-        } \
-      } /* omp parallel */ \
+      ADJOINT_TILES(ths->d, ths->n, ths->m, ths->index_x, ths->M_total, \
+          MACRO_adjoint_nd_B_OMP_BLOCKWISE_COMPUTE(whichone)) \
       return; \
-    } /* if(NFFT_OMP_BLOCKWISE_ADJOINT) */ \
+    } \
 }
 
 #define MACRO_adjoint_nd_B_OMP_COMPUTE(whichone) \
@@ -2729,56 +2577,11 @@ static void nfft_trafo_1d_B(X(plan) *ths)
 { \
     if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT) \
     { \
-      _Pragma("omp parallel private(k)") \
-      { \
-        INT my_u0, my_o0, min_u_a, max_u_a, min_u_b, max_u_b; \
-        INT *ar_x = ths->index_x; \
- \
-        nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-        		                          &min_u_b, &max_u_b, 1, &n, m, ar_x, ths->M_total); \
- \
-        if (min_u_a != -1) \
-        { \
-          k = index_x_binary_search(ar_x, M, min_u_a); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_a || u_prod > max_u_a) \
-              break; \
- \
-            MACRO_adjoint_1d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
- \
-        if (min_u_b != -1) \
-        { \
-          k = index_x_binary_search(ar_x, M, min_u_b); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_b || u_prod > max_u_b) \
-              break; \
- \
-            MACRO_adjoint_1d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
-      } /* omp parallel */ \
+      const INT my_u0 = 0, my_o0 = n - 1; \
+      ADJOINT_TILES(1, &n, m, ths->index_x, M, \
+          MACRO_adjoint_1d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone) \
       return; \
-    } /* if(NFFT_OMP_BLOCKWISE_ADJOINT) */ \
+    } \
 }
 
 static void nfft_adjoint_1d_B(X(plan) *ths)
@@ -3183,8 +2986,8 @@ static void nfft_adjoint_2d_compute_omp_atomic(const C f, C *g,
 
 #ifdef _OPENMP
 /** 
- * Adjoint NFFT for two-dimensional case updating only a specified range of
- * vector g.
+ * Adjoint NFFT for two-dimensional case: adds the window of node x_j times f
+ * into g.
  *
  * \arg f input coefficient f[j]
  * \arg g output vector g
@@ -3195,15 +2998,12 @@ static void nfft_adjoint_2d_compute_omp_atomic(const C f, C *g,
  * \arg n0 FFTW length (number oversampled Fourier coefficients) first comp.
  * \arg n1 FFTW length (number oversampled Fourier coefficients) second comp.
  * \arg m window length
- * \arg my_u0 lowest index (first component) the current thread writes to
- * \arg my_o0 highest index (second component) the current thread writes to
  *
  * \author Toni Volkmer
  */
 static inline void adjoint_2d_w(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *xj0, const R *xj1,
-    const INT n0, const INT n1, const INT my_u0, const INT my_o0,
-    const INT m, const INT w)
+    const INT n0, const INT n1, const INT m, const INT w)
 {
   INT u0, o0, u1, o1, l, l0;
   INT i1[w];
@@ -3216,12 +3016,9 @@ static inline void adjoint_2d_w(const C f, C *g,
   for (l = 0; l < w; l++)
     v[l] = f * psij_const1[l];
 
-  /* only the rows k0 in [my_u0, my_o0] of the window belong to this thread */
   for (l0 = 0; l0 < w; l0++)
   {
     const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
-    if (k0 < my_u0 || k0 > my_o0)
-      continue;
     C *restrict gj = g + k0 * n1;
     const R p = psij_const0[l0];
     if (u1 < o1)
@@ -3235,11 +3032,9 @@ static inline void adjoint_2d_w(const C f, C *g,
 
 static void nfft_adjoint_2d_compute_omp_blockwise(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *xj0, const R *xj1,
-    const INT n0, const INT n1, const INT m,
-    const INT my_u0, const INT my_o0)
+    const INT n0, const INT n1, const INT m)
 {
-  WITH_WIDTH(m, adjoint_2d_w, f, g, psij_const0, psij_const1, xj0, xj1, n0, n1,
-      my_u0, my_o0)
+  WITH_WIDTH(m, adjoint_2d_w, f, g, psij_const0, psij_const1, xj0, xj1, n0, n1)
 }
 #endif
 
@@ -3505,7 +3300,7 @@ static void nfft_trafo_2d_B(X(plan) *ths)
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_PRE_PSI \
             nfft_adjoint_2d_compute_omp_blockwise(ths->f[j], g, \
                 ths->psi+j*2*(2*m+2), ths->psi+(j*2+1)*(2*m+2), \
-                ths->x+2*j, ths->x+2*j+1, n0, n1, m, my_u0, my_o0);
+                ths->x+2*j, ths->x+2*j+1, n0, n1, m);
 
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_PRE_FG_PSI \
 { \
@@ -3526,7 +3321,7 @@ static void nfft_trafo_2d_B(X(plan) *ths)
  \
             nfft_adjoint_2d_compute_omp_blockwise(ths->f[j], g, \
                 psij0, psij1, ths->x+2*j, ths->x+2*j+1, \
-                n0, n1, m, my_u0, my_o0); \
+                n0, n1, m); \
 }
 
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_FG_PSI \
@@ -3558,7 +3353,7 @@ static void nfft_trafo_2d_B(X(plan) *ths)
  \
             nfft_adjoint_2d_compute_omp_blockwise(ths->f[j], g, \
                 psij0, psij1, ths->x+2*j, ths->x+2*j+1, \
-                n0, n1, m, my_u0, my_o0); \
+                n0, n1, m); \
 }
 
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_PRE_LIN_PSI \
@@ -3586,7 +3381,7 @@ static void nfft_trafo_2d_B(X(plan) *ths)
  \
             nfft_adjoint_2d_compute_omp_blockwise(ths->f[j], g, \
                 psij_const, psij_const+2*m+2, ths->x+2*j, ths->x+2*j+1, \
-                n0, n1, m, my_u0, my_o0); \
+                n0, n1, m); \
 }
 
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_NO_PSI \
@@ -3602,63 +3397,17 @@ static void nfft_trafo_2d_B(X(plan) *ths)
  \
             nfft_adjoint_2d_compute_omp_blockwise(ths->f[j], g, \
                 psij_const, psij_const+2*m+2, ths->x+2*j, ths->x+2*j+1, \
-                n0, n1, m, my_u0, my_o0); \
+                n0, n1, m); \
 }
 
 #define MACRO_adjoint_2d_B_OMP_BLOCKWISE(whichone) \
 { \
     if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT) \
     { \
-      _Pragma("omp parallel private(k)") \
-      { \
-        INT my_u0, my_o0, min_u_a, max_u_a, min_u_b, max_u_b; \
-        INT *ar_x = ths->index_x; \
- \
-        nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, 2, ths->n, m, ar_x, M); \
- \
-        if (min_u_a != -1) \
-        { \
-          k = index_x_binary_search(ar_x, M, min_u_a); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_a || u_prod > max_u_a) \
-              break; \
- \
-            MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
- \
-        if (min_u_b != -1) \
-        { \
-          INT k = index_x_binary_search(ar_x, M, min_u_b); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_b || u_prod > max_u_b) \
-              break; \
- \
-            MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
-      } /* omp parallel */ \
+      ADJOINT_TILES(2, ths->n, m, ths->index_x, M, \
+          MACRO_adjoint_2d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone) \
       return; \
-    } /* if(NFFT_OMP_BLOCKWISE_ADJOINT) */ \
+    } \
 }
 
 
@@ -4121,8 +3870,8 @@ static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
 
 #ifdef _OPENMP
 /** 
- * Adjoint NFFT for three-dimensional case updating only a specified range of
- * vector g.
+ * Adjoint NFFT for three-dimensional case: adds the window of node x_j times f
+ * into g.
  *
  * \arg f input coefficient f[j]
  * \arg g output vector g
@@ -4136,16 +3885,13 @@ static void nfft_trafo_3d_compute(C *fj, const C *g, const R *psij_const0,
  * \arg n1 FFTW length (number oversampled Fourier coefficients) second comp.
  * \arg n2 FFTW length (number oversampled Fourier coefficients) third comp.
  * \arg m window length
- * \arg my_u0 lowest index (first component) the current thread writes to
- * \arg my_o0 highest index (second component) the current thread writes to
  *
  * \author Toni Volkmer
  */
 static inline void adjoint_3d_w(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *psij_const2,
     const R *xj0, const R *xj1, const R *xj2,
-    const INT n0, const INT n1, const INT n2, const INT my_u0, const INT my_o0,
-    const INT m, const INT w)
+    const INT n0, const INT n1, const INT n2, const INT m, const INT w)
 {
   INT u0, o0, u1, o1, u2, o2, l, l0, l1;
   INT i1[w], i2[w];
@@ -4161,12 +3907,9 @@ static inline void adjoint_3d_w(const C f, C *g,
   for (l = 0; l < w; l++)
     v[l] = f * psij_const2[l];
 
-  /* only the rows k0 in [my_u0, my_o0] of the window belong to this thread */
   for (l0 = 0; l0 < w; l0++)
   {
     const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
-    if (k0 < my_u0 || k0 > my_o0)
-      continue;
     for (l1 = 0; l1 < w; l1++)
     {
       C *restrict gj = g + (k0 * n1 + i1[l1]) * n2;
@@ -4184,11 +3927,10 @@ static inline void adjoint_3d_w(const C f, C *g,
 static void nfft_adjoint_3d_compute_omp_blockwise(const C f, C *g,
     const R *psij_const0, const R *psij_const1, const R *psij_const2,
     const R *xj0, const R *xj1, const R *xj2,
-    const INT n0, const INT n1, const INT n2, const INT m,
-    const INT my_u0, const INT my_o0)
+    const INT n0, const INT n1, const INT n2, const INT m)
 {
   WITH_WIDTH(m, adjoint_3d_w, f, g, psij_const0, psij_const1, psij_const2,
-      xj0, xj1, xj2, n0, n1, n2, my_u0, my_o0)
+      xj0, xj1, xj2, n0, n1, n2)
 }
 #endif
 
@@ -4707,7 +4449,7 @@ static void nfft_trafo_3d_B(X(plan) *ths)
                 ths->psi+(j*3+1)*(2*m+2), \
                 ths->psi+(j*3+2)*(2*m+2), \
                 ths->x+3*j, ths->x+3*j+1, ths->x+3*j+2, \
-                n0, n1, n2, m, my_u0, my_o0);
+                n0, n1, n2, m);
 
 #define MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_PRE_FG_PSI \
 { \
@@ -4735,7 +4477,7 @@ static void nfft_trafo_3d_B(X(plan) *ths)
             nfft_adjoint_3d_compute_omp_blockwise(ths->f[j], g, \
                 psij0, psij1, psij2, \
                 ths->x+3*j, ths->x+3*j+1, ths->x+3*j+2, \
-                n0, n1, n2, m, my_u0, my_o0); \
+                n0, n1, n2, m); \
 }
 
 #define MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_FG_PSI \
@@ -4779,7 +4521,7 @@ static void nfft_trafo_3d_B(X(plan) *ths)
             nfft_adjoint_3d_compute_omp_blockwise(ths->f[j], g, \
                 psij0, psij1, psij2, \
                 ths->x+3*j, ths->x+3*j+1, ths->x+3*j+2, \
-                n0, n1, n2, m, my_u0, my_o0); \
+                n0, n1, n2, m); \
 }
 
 #define MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_PRE_LIN_PSI \
@@ -4816,7 +4558,7 @@ static void nfft_trafo_3d_B(X(plan) *ths)
             nfft_adjoint_3d_compute_omp_blockwise(ths->f[j], g, \
                 psij_const, psij_const+2*m+2, psij_const+(2*m+2)*2, \
                 ths->x+3*j, ths->x+3*j+1, ths->x+3*j+2, \
-                n0, n1, n2, m, my_u0, my_o0); \
+                n0, n1, n2, m); \
 }
 
 #define MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_NO_PSI \
@@ -4836,63 +4578,17 @@ static void nfft_trafo_3d_B(X(plan) *ths)
             nfft_adjoint_3d_compute_omp_blockwise(ths->f[j], g, \
                 psij_const, psij_const+2*m+2, psij_const+(2*m+2)*2, \
                 ths->x+3*j, ths->x+3*j+1, ths->x+3*j+2, \
-                n0, n1, n2, m, my_u0, my_o0); \
+                n0, n1, n2, m); \
 }
 
 #define MACRO_adjoint_3d_B_OMP_BLOCKWISE(whichone) \
 { \
     if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT) \
     { \
-      _Pragma("omp parallel private(k)") \
-      { \
-        INT my_u0, my_o0, min_u_a, max_u_a, min_u_b, max_u_b; \
-        INT *ar_x = ths->index_x; \
- \
-        nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &min_u_a, &max_u_a, \
-            &min_u_b, &max_u_b, 3, ths->n, m, ar_x, M); \
- \
-        if (min_u_a != -1) \
-        { \
-          k = index_x_binary_search(ar_x, M, min_u_a); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_A \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_a || u_prod > max_u_a) \
-              break; \
- \
-            MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
- \
-        if (min_u_b != -1) \
-        { \
-          INT k = index_x_binary_search(ar_x, M, min_u_b); \
- \
-          MACRO_adjoint_nd_B_OMP_BLOCKWISE_ASSERT_B \
- \
-          while (k < M) \
-          { \
-            INT u_prod = ar_x[2*k]; \
-            INT j = ar_x[2*k+1]; \
- \
-            if (u_prod < min_u_b || u_prod > max_u_b) \
-              break; \
- \
-            MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone \
- \
-            k++; \
-          } \
-        } \
-      } /* omp parallel */ \
+      ADJOINT_TILES(3, ths->n, m, ths->index_x, M, \
+          MACRO_adjoint_3d_B_OMP_BLOCKWISE_COMPUTE_ ##whichone) \
       return; \
-    } /* if(NFFT_OMP_BLOCKWISE_ADJOINT) */ \
+    } \
 }
 
 static void nfft_adjoint_3d_B(X(plan) *ths)
@@ -5569,10 +5265,10 @@ static inline void trafo_real_3d_w(R *fj, const R *g, const R *psij_const0,
   *fj = sum;
 }
 
-/* adds f psi into the rows k0 in [my_u0, my_o0] of g */
+/* adds f psi into g */
 static inline void adjoint_real_2d_w(const R f, R *g, const R *psij_const0,
     const R *psij_const1, const R *xj0, const R *xj1, const INT n0,
-    const INT n1, const INT my_u0, const INT my_o0, const INT m, const INT w)
+    const INT n1, const INT m, const INT w)
 {
   INT u0, o0, u1, o1, l, l0;
   INT i1[w];
@@ -5588,8 +5284,6 @@ static inline void adjoint_real_2d_w(const R f, R *g, const R *psij_const0,
   for (l0 = 0; l0 < w; l0++)
   {
     const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
-    if (k0 < my_u0 || k0 > my_o0)
-      continue;
     R *restrict gj = g + k0 * n1;
     const R p = psij_const0[l0];
     if (u1 < o1)
@@ -5603,8 +5297,8 @@ static inline void adjoint_real_2d_w(const R f, R *g, const R *psij_const0,
 
 static inline void adjoint_real_3d_w(const R f, R *g, const R *psij_const0,
     const R *psij_const1, const R *psij_const2, const R *xj0, const R *xj1,
-    const R *xj2, const INT n0, const INT n1, const INT n2, const INT my_u0,
-    const INT my_o0, const INT m, const INT w)
+    const R *xj2, const INT n0, const INT n1, const INT n2, const INT m,
+    const INT w)
 {
   INT u0, o0, u1, o1, u2, o2, l, l0, l1;
   INT i1[w], i2[w];
@@ -5622,8 +5316,6 @@ static inline void adjoint_real_3d_w(const R f, R *g, const R *psij_const0,
   for (l0 = 0; l0 < w; l0++)
   {
     const INT k0 = u0 + l0 < n0 ? u0 + l0 : u0 + l0 - n0;
-    if (k0 < my_u0 || k0 > my_o0)
-      continue;
     for (l1 = 0; l1 < w; l1++)
     {
       R *restrict gj = g + (k0 * n1 + i1[l1]) * n2;
@@ -5687,9 +5379,8 @@ static void real_B_trafo(X(plan) *ths)
   }
 }
 
-/* the contribution of node j to the rows [my_u0, my_o0] of g */
-static inline void real_adjoint_node(const X(plan) *ths, R *g, const INT j,
-    const INT my_u0, const INT my_o0)
+/* the contribution of node j to g */
+static inline void real_adjoint_node(const X(plan) *ths, R *g, const INT j)
 {
   const INT d = ths->d, m = ths->m, w = 2 * m + 2, *n = ths->n;
   const R *x = ths->x + j * d, f = CREAL(ths->f[j]);
@@ -5698,13 +5389,12 @@ static inline void real_adjoint_node(const X(plan) *ths, R *g, const INT j,
 
   if (d == 2)
   {
-    WITH_WIDTH(m, adjoint_real_2d_w, f, g, psi, psi + w, x, x + 1, n[0], n[1],
-        my_u0, my_o0)
+    WITH_WIDTH(m, adjoint_real_2d_w, f, g, psi, psi + w, x, x + 1, n[0], n[1])
   }
   else
   {
     WITH_WIDTH(m, adjoint_real_3d_w, f, g, psi, psi + w, psi + 2 * w, x, x + 1,
-        x + 2, n[0], n[1], n[2], my_u0, my_o0)
+        x + 2, n[0], n[1], n[2])
   }
 }
 
@@ -5722,26 +5412,14 @@ static void real_B_adjoint(X(plan) *ths)
 #ifdef _OPENMP
   if (ths->flags & NFFT_OMP_BLOCKWISE_ADJOINT)
   {
-    #pragma omp parallel private(k)
-    {
-      const INT *ar_x = ths->index_x;
-      INT my_u0, my_o0, lo[2], hi[2];
-
-      nfft_adjoint_B_omp_blockwise_init(&my_u0, &my_o0, &lo[0], &hi[0], &lo[1],
-          &hi[1], ths->d, ths->n, ths->m, ar_x, M);
-
-      for (INT part = 0; part < 2; part++)
-        if (lo[part] != -1)
-          for (k = index_x_binary_search(ar_x, M, lo[part]); k < M
-              && ar_x[2 * k] >= lo[part] && ar_x[2 * k] <= hi[part]; k++)
-            real_adjoint_node(ths, g, ar_x[2 * k + 1], my_u0, my_o0);
-    }
+    ADJOINT_TILES(ths->d, ths->n, ths->m, ths->index_x, M,
+        real_adjoint_node(ths, g, j);)
     return;
   }
 #endif
 
   for (k = 0; k < M; k++)
-    real_adjoint_node(ths, g, k, 0, ths->n[0] - 1);
+    real_adjoint_node(ths, g, k);
 }
 
 static void real_trafo(X(plan) *ths)
