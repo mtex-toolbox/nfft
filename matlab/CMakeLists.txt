@@ -7,7 +7,7 @@ elseif(NFFT_WITH_MATLAB)
   set(_mex nfft_add_matlab_mex)
 endif()
 
-cmake_language(CALL ${_mex} nfft nfftmex.c)
+cmake_language(CALL ${_mex} nfft nfftmex.c API R2018a)
 cmake_language(CALL ${_mex} nfct nfctmex.c)
 cmake_language(CALL ${_mex} nfst nfstmex.c)
 if(NFFT_ENABLE_APPLICATIONS)

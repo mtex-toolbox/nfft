@@ -74,7 +74,7 @@ static inline void get_guru(const mxArray *prhs[], int d, int *N, int *M, int *n
   *f2 = mxGetScalar(mxGetCell(prhs[1], (unsigned int)(2*d+4)));
 }
 
-#if MX_HAS_INTERLEAVED_COMPLEX
+#if MX_HAS_INTERLEAVED_COMPLEX && !defined(NFFT_MEXAPI_VERSION_LINKED)
 MEXFUNCTION_LINKAGE
 void mexfilerequiredapiversion(unsigned int *built_by_rel, unsigned int *target_api_ver)
 {
