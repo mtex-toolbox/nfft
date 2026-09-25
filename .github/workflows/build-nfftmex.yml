@@ -60,7 +60,7 @@ jobs:
           if command -v cygpath > /dev/null; then r=$(cygpath -m "$r"); fi
           echo "MATLAB_ROOT=$r" >> "$GITHUB_ENV"
           echo "MATLAB root: $r"
-          ls "$r/bin/${{ matrix.arch }}" | grep -iE "fftw|omp" || true
+          ls "$r/bin/${{ matrix.arch }}" | grep -E "fftw|omp[0-9]*\.|iomp" || true
 
       - name: tools (Linux)
         if: runner.os == 'Linux'
@@ -70,7 +70,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install fftw libomp ninja
-          echo "OMP_ROOT=$(brew --prefix libomp)" >> "$GITHUB_ENV"
+          # omp.h from Homebrew, but the runtime MATLAB ships: a second OpenMP
+          # runtime in the MATLAB process fails to initialise
+          lib=$(ls "$MATLAB_ROOT/bin/${{ matrix.arch }}"/lib{omp,iomp5}.dylib 2>/dev/null | head -1)
+          [ -n "$lib" ] || { echo "no OpenMP runtime in MATLAB"; exit 1; }
+          echo "MATLAB OpenMP runtime: $lib"
+          echo "OMP_ARGS=-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
+          echo "OMP_LIB=$lib" >> "$GITHUB_ENV"
 
       - name: tools (Windows)
         if: runner.os == 'Windows'
@@ -88,11 +94,15 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          omp=()
+          if [ -n "$OMP_LIB" ]; then
+            omp=("$OMP_ARGS" -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$OMP_LIB")
+          fi
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
             -DNFFT_WITH_MATLAB="$MATLAB_ROOT" \
             -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON \
-            ${OMP_ROOT:+-DOpenMP_ROOT=$OMP_ROOT}
+            "${omp[@]}"
           cmake --build build --target matlab_nfftmex
 
       - name: build (Windows)

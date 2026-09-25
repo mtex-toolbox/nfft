@@ -70,6 +70,9 @@ function(nfft_add_matlab_mex module source)
   set(tgt "matlab_${module}mex")
   set(outdir "${CMAKE_CURRENT_BINARY_DIR}/${module}")
   nfft_mex_helper_library(_helper matlab ${Matlab_INCLUDE_DIRS})
+  # the helper calls mex and mx functions: a linker resolving archives in order
+  # (MinGW) needs MATLAB's libraries after it
+  target_link_libraries(${_helper} INTERFACE ${Matlab_MEX_LIBRARY} ${Matlab_MX_LIBRARY})
 
   if(NFFT_ENABLE_MATLAB_THREADS)
     set(_kernel nfft3_iface_omp)
