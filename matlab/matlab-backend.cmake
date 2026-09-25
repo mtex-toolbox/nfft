@@ -26,14 +26,20 @@ endif()
 set(_mlbin "${Matlab_ROOT_DIR}/bin/${_arch}")
 find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3 HINTS "${_mlbin}" NO_DEFAULT_PATH)
 if(NOT Matlab_FFTW_LIBRARY)
-  file(GLOB _mwfftw_versioned "${_mlbin}/libmwfftw3.so.*" "${_mlbin}/libmwfftw3.*.dylib")
+  file(GLOB _mwfftw_versioned "${_mlbin}/libmwfftw3.so.*" "${_mlbin}/libmwfftw3.*.dylib"
+       "${_mlbin}/libmwfftw3.dll")
   if(_mwfftw_versioned)
     list(GET _mwfftw_versioned 0 _mwfftw_real)
-    file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/matlab-fftw")
-    file(CREATE_LINK "${_mwfftw_real}"
-         "${PROJECT_BINARY_DIR}/matlab-fftw/libmwfftw3.so" SYMBOLIC)
-    find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3
-      HINTS "${PROJECT_BINARY_DIR}/matlab-fftw" NO_DEFAULT_PATH)
+    if(WIN32)
+      # MinGW links against the DLL itself, MATLAB ships no import library for it
+      set(Matlab_FFTW_LIBRARY "${_mwfftw_real}")
+    else()
+      file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/matlab-fftw")
+      file(CREATE_LINK "${_mwfftw_real}"
+           "${PROJECT_BINARY_DIR}/matlab-fftw/libmwfftw3${CMAKE_SHARED_LIBRARY_SUFFIX}" SYMBOLIC)
+      find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3
+        HINTS "${PROJECT_BINARY_DIR}/matlab-fftw" NO_DEFAULT_PATH)
+    endif()
   endif()
 endif()
 if(NOT Matlab_FFTW_LIBRARY)

@@ -1,0 +1,27 @@
+% smoke test of a freshly built nfftmex: fast against direct transforms, and
+% the half spectrum of a real plan; errors make the CI step fail
+fprintf('nfftmex: %s\nthreads: %d\n', which('nfftmex'), nfftmex('get_num_threads'));
+rng(1);
+for d = 2:3
+  N = 8*ones(1,d); M = 60;
+  x = rand(d,M) - 0.5;
+  fh = complex(randn(prod(N),1), randn(prod(N),1));
+  p = nfftmex('init_guru', [{d}, num2cell(N), {M}, num2cell(2*N), {4, 1+2^10+2^12, int8(64)}]);
+  nfftmex('set_x', p, x);
+  nfftmex('precompute_psi', p);
+  nfftmex('set_f_hat', p, fh);
+  nfftmex('trafo', p);         f1 = nfftmex('get_f', p);
+  nfftmex('trafo_direct', p);  f2 = nfftmex('get_f', p);
+  nfftmex('set_f', p, f2);
+  nfftmex('adjoint', p);       g1 = nfftmex('get_f_hat', p);
+  nfftmex('adjoint_direct', p); g2 = nfftmex('get_f_hat', p);
+  nfftmex('finalize', p);
+  e = [norm(f1-f2)/norm(f2), norm(g1-g2)/norm(g2)];
+  fprintf('%dd trafo error %.1e, adjoint error %.1e\n', d, e);
+  assert(all(e < 1e-6), 'nfftmex: %dd transform does not match the direct one', d);
+end
+p = nfftmex('init_guru', {2, 4, 4, 1, 8, 8, 2, 1+2^10+2^14, int8(64)});
+n = numel(nfftmex('get_f_hat', p));
+nfftmex('finalize', p);
+assert(n == 8, 'nfftmex: a real plan holds %d coefficients, not the half spectrum 8', n);
+disp('nfftmex smoke test passed');

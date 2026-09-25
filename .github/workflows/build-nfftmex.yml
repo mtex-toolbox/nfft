@@ -1,0 +1,136 @@
+name: build nfftmex
+
+# nfftmex for MATLAB R2024b on every platform MTEX ships, through the CMake
+# backend: build, list the dynamic dependencies, run the smoke test in MATLAB
+# and upload the binary as an artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/mtex-kernels]
+    paths:
+      - 'kernel/**'
+      - 'include/**'
+      - 'matlab/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-nfftmex.yml'
+      - '.github/scripts/nfftmex_smoke.m'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.ext }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ext: mexa64
+            arch: glnxa64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+          - os: windows-latest
+            ext: mexw64
+            arch: win64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+          - os: macos-14
+            ext: mexmaca64
+            arch: maca64
+            cflags: -O3 -ffast-math
+          - os: macos-15-intel
+            ext: mexmaci64
+            arch: maci64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: R2024b
+
+      - name: locate MATLAB
+        shell: bash
+        run: |
+          r=$(dirname "$(dirname "$(command -v matlab)")")
+          if command -v cygpath > /dev/null; then r=$(cygpath -m "$r"); fi
+          echo "MATLAB_ROOT=$r" >> "$GITHUB_ENV"
+          echo "MATLAB root: $r"
+          ls "$r/bin/${{ matrix.arch }}" | grep -iE "fftw|omp" || true
+
+      - name: tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libfftw3-dev ninja-build
+
+      - name: tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install fftw libomp ninja
+          echo "OMP_ROOT=$(brew --prefix libomp)" >> "$GITHUB_ENV"
+
+      - name: tools (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-fftw
+
+      - name: build (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
+            -DNFFT_WITH_MATLAB="$MATLAB_ROOT" \
+            -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON \
+            ${OMP_ROOT:+-DOpenMP_ROOT=$OMP_ROOT}
+          cmake --build build --target matlab_nfftmex
+
+      - name: build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          # -static links the MinGW runtimes (libgcc, libgomp, winpthread) into
+          # the mex, which must load without MSYS2 on the PATH
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
+            -DCMAKE_SHARED_LINKER_FLAGS=-static -DCMAKE_MODULE_LINKER_FLAGS=-static \
+            -DNFFT_WITH_MATLAB="$MATLAB_ROOT" \
+            -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON
+          cmake --build build --target matlab_nfftmex
+
+      - name: dynamic dependencies (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          f=build/matlab/nfft/nfftmex.${{ matrix.ext }}
+          ls -la "$f"
+          if [ "${{ runner.os }}" = Linux ]; then ldd "$f"; else otool -L "$f"; fi
+
+      - name: dynamic dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          f=build/matlab/nfft/nfftmex.${{ matrix.ext }}
+          ls -la "$f"
+          objdump -p "$f" | grep "DLL Name"
+
+      - name: smoke test in MATLAB
+        uses: matlab-actions/run-command@v2
+        with:
+          command: addpath(fullfile(pwd,'build','matlab','nfft')); run(fullfile(pwd,'.github','scripts','nfftmex_smoke.m'))
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfftmex-${{ matrix.ext }}
+          path: build/matlab/nfft/nfftmex.${{ matrix.ext }}
