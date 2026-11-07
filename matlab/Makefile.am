@@ -17,6 +17,7 @@ else
 endif
 
 DIR_NFFT=nfft
+DIR_RNFFT=rnfft
 
 if HAVE_NFCT
   DIR_NFCT=nfct
@@ -39,7 +40,7 @@ endif
 DIR_FASTSUM=fastsum
 DIR_INFFT1D=infft1d
 
-SUBDIRS = . $(DIR_NFFT) $(DIR_NFCT) $(DIR_NFST) $(DIR_NFSFT) $(DIR_NFSOFT) $(DIR_NNFFT) $(DIR_FASTSUM) $(DIR_INFFT1D) $(DIR_FPT) tests
+SUBDIRS = . $(DIR_NFFT) $(DIR_RNFFT) $(DIR_NFCT) $(DIR_NFST) $(DIR_NFSFT) $(DIR_NFSOFT) $(DIR_NNFFT) $(DIR_FASTSUM) $(DIR_INFFT1D) $(DIR_FPT) tests
 
 AM_CPPFLAGS = -I$(top_srcdir)/include $(matlab_CPPFLAGS)
 

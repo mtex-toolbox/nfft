@@ -8,6 +8,7 @@ elseif(NFFT_WITH_MATLAB)
 endif()
 
 cmake_language(CALL ${_mex} nfft nfftmex.c)
+cmake_language(CALL ${_mex} rnfft rnfftmex.c)
 cmake_language(CALL ${_mex} nfct nfctmex.c)
 cmake_language(CALL ${_mex} nfst nfstmex.c)
 if(NFFT_ENABLE_APPLICATIONS)
