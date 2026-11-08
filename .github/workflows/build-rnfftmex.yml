@@ -1,0 +1,167 @@
+name: build rnfftmex
+
+# rnfftmex for MATLAB R2024b on every platform MTEX ships, through the CMake
+# backend: build, list the dynamic dependencies, run the smoke test in MATLAB
+# and upload the binary as an artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/rnfftmex-build]
+    paths:
+      - 'kernel/**'
+      - 'include/**'
+      - 'matlab/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-rnfftmex.yml'
+      - '.github/scripts/rnfftmex_smoke.m'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.ext }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ext: mexa64
+            arch: glnxa64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+          - os: windows-latest
+            ext: mexw64
+            arch: win64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+          - os: macos-14
+            ext: mexmaca64
+            arch: maca64
+            cflags: -O3 -ffast-math
+          - os: macos-15-intel
+            ext: mexmaci64
+            arch: maci64
+            cflags: -O3 -ffast-math -march=x86-64-v3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          release: R2024b
+
+      - name: locate MATLAB
+        shell: bash
+        run: |
+          r=$(dirname "$(dirname "$(command -v matlab)")")
+          if command -v cygpath > /dev/null; then r=$(cygpath -m "$r"); fi
+          echo "MATLAB_ROOT=$r" >> "$GITHUB_ENV"
+          echo "MATLAB root: $r"
+          ls "$r/bin/${{ matrix.arch }}" | grep -E "fftw|omp[0-9]*\.|iomp" || true
+
+      - name: tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libfftw3-dev ninja-build
+
+      - name: tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install fftw libomp ninja
+          # omp.h from Homebrew, but the runtime MATLAB ships: a second OpenMP
+          # runtime in the MATLAB process fails to initialise. Without one in
+          # MATLAB the mex is built single threaded.
+          lib=$(find "$MATLAB_ROOT/bin/${{ matrix.arch }}" "$MATLAB_ROOT/sys/os/${{ matrix.arch }}" \
+                -name 'libomp.dylib' -o -name 'libiomp5.dylib' 2>/dev/null | head -1)
+          if [ -n "$lib" ]; then
+            echo "MATLAB OpenMP runtime: $lib"
+            echo "OMP_ARGS=-DOpenMP_C_FLAGS=-Xclang -fopenmp -I$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
+            echo "OMP_LIB=$lib" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no OpenMP runtime in MATLAB, rnfftmex.${{ matrix.ext }} is single threaded"
+            echo "THREADS=OFF" >> "$GITHUB_ENV"
+          fi
+
+      - name: tools (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-fftw
+
+      - name: build (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # the mex uses MATLAB's FFTW: a threaded system FFTW would only bring
+          # its own OpenMP runtime into CMake's run check
+          omp=(-DFFTW3_OMP_LIBRARY=OFF)
+          if [ -n "$OMP_LIB" ]; then
+            omp+=("$OMP_ARGS" -DOpenMP_C_LIB_NAMES=omp "-DOpenMP_omp_LIBRARY=$OMP_LIB")
+          fi
+          t=${THREADS:-ON}
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
+            -DNFFT_WITH_MATLAB="$MATLAB_ROOT" -DNFFT_ENABLE_MAXOPT=OFF \
+            -DNFFT_ENABLE_OPENMP=$t -DNFFT_ENABLE_MATLAB_THREADS=$t \
+            "${omp[@]}"
+          cmake --build build --target matlab_rnfftmex
+
+      - name: build (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          # the MinGW runtimes (libgcc, libgomp, winpthread) go into the mex,
+          # which must load without MSYS2: -static alone keeps the import
+          # library of libgomp that FindOpenMP names
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="${{ matrix.cflags }}" \
+            -DCMAKE_SHARED_LINKER_FLAGS=-static -DCMAKE_MODULE_LINKER_FLAGS=-static \
+            -DOpenMP_gomp_LIBRARY="$(gcc -print-file-name=libgomp.a)" \
+            -DOpenMP_pthread_LIBRARY="$(gcc -print-file-name=libwinpthread.a)" \
+            -DFFTW3_OMP_LIBRARY=OFF \
+            -DNFFT_WITH_MATLAB="$MATLAB_ROOT" -DNFFT_ENABLE_MAXOPT=OFF \
+            -DNFFT_ENABLE_OPENMP=ON -DNFFT_ENABLE_MATLAB_THREADS=ON
+          cmake --build build --target matlab_rnfftmex
+
+      - name: dynamic dependencies (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          f=build/matlab/rnfft/rnfftmex.${{ matrix.ext }}
+          ls -la "$f"
+          if [ "${{ runner.os }}" = Linux ]; then ldd "$f"; else otool -L "$f"; fi
+          # nothing a MATLAB user would lack: no Homebrew library on macOS
+          if [ "${{ runner.os }}" = macOS ] && otool -L "$f" | grep -qE "/opt/homebrew|/usr/local"; then
+            echo "::error::rnfftmex depends on a Homebrew library"; exit 1
+          fi
+
+      - name: dynamic dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          f=build/matlab/rnfft/rnfftmex.${{ matrix.ext }}
+          ls -la "$f"
+          objdump -p "$f" | grep "DLL Name"
+          # only system and MATLAB DLLs, no MinGW runtime
+          if objdump -p "$f" | grep -qiE "DLL Name: (libgomp|libwinpthread|libgcc)"; then
+            echo "::error::rnfftmex depends on a MinGW runtime DLL"; exit 1
+          fi
+
+      - name: smoke test in MATLAB
+        uses: matlab-actions/run-command@v2
+        with:
+          command: addpath(fullfile(pwd,'build','matlab','rnfft')); run(fullfile(pwd,'.github','scripts','rnfftmex_smoke.m'))
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rnfftmex-${{ matrix.ext }}
+          path: build/matlab/rnfft/rnfftmex.${{ matrix.ext }}

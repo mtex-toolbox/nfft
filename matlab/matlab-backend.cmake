@@ -26,14 +26,20 @@ endif()
 set(_mlbin "${Matlab_ROOT_DIR}/bin/${_arch}")
 find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3 HINTS "${_mlbin}" NO_DEFAULT_PATH)
 if(NOT Matlab_FFTW_LIBRARY)
-  file(GLOB _mwfftw_versioned "${_mlbin}/libmwfftw3.so.*" "${_mlbin}/libmwfftw3.*.dylib")
+  file(GLOB _mwfftw_versioned "${_mlbin}/libmwfftw3.so.*" "${_mlbin}/libmwfftw3.*.dylib"
+       "${_mlbin}/libmwfftw3.dll")
   if(_mwfftw_versioned)
     list(GET _mwfftw_versioned 0 _mwfftw_real)
-    file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/matlab-fftw")
-    file(CREATE_LINK "${_mwfftw_real}"
-         "${PROJECT_BINARY_DIR}/matlab-fftw/libmwfftw3.so" SYMBOLIC)
-    find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3
-      HINTS "${PROJECT_BINARY_DIR}/matlab-fftw" NO_DEFAULT_PATH)
+    if(WIN32)
+      # MinGW links against the DLL itself, MATLAB ships no import library for it
+      set(Matlab_FFTW_LIBRARY "${_mwfftw_real}")
+    else()
+      file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/matlab-fftw")
+      file(CREATE_LINK "${_mwfftw_real}"
+           "${PROJECT_BINARY_DIR}/matlab-fftw/libmwfftw3${CMAKE_SHARED_LIBRARY_SUFFIX}" SYMBOLIC)
+      find_library(Matlab_FFTW_LIBRARY NAMES mwfftw3
+        HINTS "${PROJECT_BINARY_DIR}/matlab-fftw" NO_DEFAULT_PATH)
+    endif()
   endif()
 endif()
 if(NOT Matlab_FFTW_LIBRARY)
@@ -52,15 +58,21 @@ if(NFFT_ENABLE_MATLAB_THREADS)
                   "verify on the MATLAB host or set NFFT_ENABLE_MATLAB_THREADS=OFF.")
 endif()
 
-# nfft_add_matlab_mex(<module> <source.c> [EXTRA_INC ...] [EXTRA_LINK ...])
+# nfft_add_matlab_mex(<module> <source.c> [API <release>] [EXTRA_INC ...] [EXTRA_LINK ...])
 # Builds build/matlab/<module>/<module>mex.<mexext> via matlab_add_mex, links the
 # interface kernel + MATLAB's bundled FFTW + the matlab mex helper, stages .m
 # wrappers (+ @f_hat) beside it, and installs lib -> libdir, .m -> datadir.
 function(nfft_add_matlab_mex module source)
-  cmake_parse_arguments(MX "" "" "EXTRA_INC;EXTRA_LINK" ${ARGN})
+  cmake_parse_arguments(MX "" "API" "EXTRA_INC;EXTRA_LINK" ${ARGN})
+  if(NOT MX_API)
+    set(MX_API R2017b)           # separate complex C API (code uses mxGetPr/mxGetPi)
+  endif()
   set(tgt "matlab_${module}mex")
   set(outdir "${CMAKE_CURRENT_BINARY_DIR}/${module}")
   nfft_mex_helper_library(_helper matlab ${Matlab_INCLUDE_DIRS})
+  # the helper calls mex and mx functions: a linker resolving archives in order
+  # (MinGW) needs MATLAB's libraries after it
+  target_link_libraries(${_helper} INTERFACE ${Matlab_MEX_LIBRARY} ${Matlab_MX_LIBRARY})
 
   if(NFFT_ENABLE_MATLAB_THREADS)
     set(_kernel nfft3_iface_omp)
@@ -72,11 +84,15 @@ function(nfft_add_matlab_mex module source)
     SRC "${PROJECT_SOURCE_DIR}/matlab/${module}/${source}"
     OUTPUT_NAME ${module}mex
     LINK_TO ${MX_EXTRA_LINK} ${_kernel} ${_helper} ${Matlab_FFTW_LIBRARY}
-    R2017b)                      # separate complex C API (code uses mxGetPr/mxGetPi)
+    ${MX_API})
+  # matlab_add_mex compiles MATLAB's c_mexapi_version.c into the mex
+  target_compile_definitions(${tgt} PRIVATE NFFT_MEXAPI_VERSION_LINKED)
   target_include_directories(${tgt} PRIVATE
     ${NFFT_GENERATED_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/matlab ${Matlab_INCLUDE_DIRS} ${MX_EXTRA_INC})
-  set_target_properties(${tgt} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${outdir}")
+  # a mex is a runtime output (DLL) on Windows, a library output elsewhere
+  set_target_properties(${tgt} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${outdir}"
+    RUNTIME_OUTPUT_DIRECTORY "${outdir}")
 
   file(GLOB _m "${PROJECT_SOURCE_DIR}/matlab/${module}/*.m")
   add_custom_command(TARGET ${tgt} POST_BUILD
