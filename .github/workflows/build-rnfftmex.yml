@@ -36,7 +36,7 @@ jobs:
             ext: mexw64
             arch: win64
             cflags: -O3 -ffast-math -march=x86-64-v3
-          - os: macos-14
+          - os: macos-15
             ext: mexmaca64
             arch: maca64
             cflags: -O3 -ffast-math
